@@ -1,0 +1,24 @@
+Subject: staging: octeon: don't drop frames on PIP length errors
+
+--- a/drivers/staging/octeon/ethernet-rx.c	2026-11-10 19:29:07.865798832 +1100
++++ b/drivers/staging/octeon/ethernet-rx.c	2026-11-10 19:29:07.881923413 +1100
+@@ -64,12 +64,14 @@
+ 	else
+ 		port = work->word1.cn38xx.ipprt;
+ 
+-	if ((work->word2.snoip.err_code == 10) && (work->word1.len <= 64))
++	if (work->word2.snoip.err_code == 10)
+ 		/*
+-		 * Ignore length errors on min size packets. Some
+-		 * equipment incorrectly pads packets to 64+4FCS
+-		 * instead of 60+4FCS.  Note these packets still get
+-		 * counted as frame errors.
++		 * Ignore length errors. Some equipment incorrectly pads
++		 * packets to 64+4FCS instead of 60+4FCS, and a DSA tag
++		 * (e.g. Broadcom, on a switch conduit port) sits where
++		 * PIP expects the 802.3 type/length field. The frame
++		 * data and FCS are still valid. Note these packets still
++		 * get counted as frame errors.
+ 		 */
+ 		return 0;
+ 

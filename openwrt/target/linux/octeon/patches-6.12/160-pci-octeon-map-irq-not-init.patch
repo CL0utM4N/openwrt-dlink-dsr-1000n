@@ -1,0 +1,17 @@
+Subject: MIPS: PCI: octeon: don't free octeon_pci_pcibios_map_irq after init
+
+It is reached via pcibios_map_irq() -> pci_assign_irq() whenever a PCI driver
+probes; for modular drivers (ath9k on D-Link DSR-1000N) that is after init
+memory is freed, so the call jumps into freed .init.text and oopses.
+
+--- a/arch/mips/pci/pci-octeon.c	2026-11-10 18:18:16.080283063 +1100
++++ b/arch/mips/pci/pci-octeon.c	2026-11-10 18:18:16.083017022 +1100
+@@ -231,7 +231,7 @@
+  *		 as it goes through each bridge.
+  * Returns Interrupt number for the device
+  */
+-int __init octeon_pci_pcibios_map_irq(const struct pci_dev *dev,
++int octeon_pci_pcibios_map_irq(const struct pci_dev *dev,
+ 				      u8 slot, u8 pin)
+ {
+ 	int irq_num;

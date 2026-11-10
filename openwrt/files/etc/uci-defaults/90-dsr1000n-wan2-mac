@@ -1,0 +1,17 @@
+#!/bin/sh
+# D-Link DSR-1000N: give the WAN2/DMZ port its real MAC (base + 2 from D-Link product data,
+# already computed into board.json) even before it is assigned to an interface.
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "dlink,dsr-1000n" ] || exit 0
+. /usr/share/libubox/jshn.sh
+json_init
+json_load "$(cat /etc/board.json)"
+json_select network_device 2>/dev/null || exit 0
+json_select wan2 2>/dev/null || exit 0
+json_get_var mac macaddr
+[ -n "$mac" ] || exit 0
+for s in $(uci -q show network | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='wan2'$/\1/p"); do exit 0; done
+s=$(uci add network device)
+uci set network.$s.name='wan2'
+uci set network.$s.macaddr="$mac"
+uci commit network
+exit 0

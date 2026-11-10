@@ -1,0 +1,13 @@
+{
+	"luci-mod-status-index-cpu": {
+		"description": "Grant access to CPU usage counters for the overview page",
+		"read": {
+			"file": {
+				"/proc/stat": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "read" ]
+			}
+		}
+	}
+}

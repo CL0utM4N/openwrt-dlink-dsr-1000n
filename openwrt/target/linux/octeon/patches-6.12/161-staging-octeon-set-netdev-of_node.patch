@@ -1,0 +1,12 @@
+Subject: staging: octeon: attach the port DT node to the net_device (for DSA conduits)
+
+--- a/drivers/staging/octeon/ethernet.c	2026-11-10 19:19:34.884916743 +1100
++++ b/drivers/staging/octeon/ethernet.c	2026-11-10 19:19:34.901109707 +1100
+@@ -869,6 +869,7 @@
+ 			priv->netdev = dev;
+ 			priv->of_node = cvm_oct_node_for_port(pip, interface,
+ 							      port_index);
++			dev->dev.of_node = priv->of_node;
+ 
+ 			INIT_DELAYED_WORK(&priv->port_periodic_work,
+ 					  cvm_oct_periodic_worker);

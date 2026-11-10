@@ -1,0 +1,5 @@
+# Keep Unix line endings for everything that runs on Linux or is applied as a patch.
+*            text=auto eol=lf
+*.patch      -text
+*.ps1        text eol=crlf
+LICENSE      text eol=lf
