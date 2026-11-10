@@ -87,7 +87,8 @@ Passed to the kernel by U-Boot (`mtdparts=`):
 | `dlink-config` | 0x1DA0000 | 2 MB | D-Link config, left untouched, read-only |
 | `dlink-data` | 0x1FA0000 | 384 KB | product data + U-Boot env, read-only |
 
-MAC addresses: LAN = base, WAN = base+1, WAN2 = base+2, Wi-Fi = base+3.
+MAC addresses: LAN = base, WAN = base+1, WAN2 = base+2. The Wi-Fi card keeps the MAC in its
+own EEPROM, which on the tested unit is also in D-Link's 90:94:E4 range (not base+3).
 
 ## U-Boot environment used by this port
 

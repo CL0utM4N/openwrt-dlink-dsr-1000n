@@ -18,7 +18,9 @@ replaces it with a current Linux 6.12 kernel, nftables firewall, WPA3 and LuCI o
 | BCM53115 switch via DSA (`lan1`..`lan4`, `wan`), port isolation | ✅ tested |
 | WAN1: DHCP, routing, firewall | ✅ tested |
 | LAN, LuCI over HTTPS (TLS 1.3) | ✅ tested |
-| Wi-Fi AR9160 (ath9k), WPA2/WPA3, WPS push-button | ✅ driver works; AP not yet tested |
+| Wi-Fi AR9160 (ath9k): client mode, used as WAN (WPA2, 5 GHz HT40, DHCP) | ✅ tested |
+| Wi-Fi access point, WPA3, WPS push-button | ⚠️ supported, not yet tested |
+| LuCI Save & Apply, settings kept across reboot | ✅ tested |
 | WAN2/DMZ port (`wan2`, BCM5481 PHY) | ⚠️ driver binds, not yet tested with a cable |
 | Real MAC addresses from D-Link product data | ✅ |
 | Reset button (reboot / factory reset), WPS button | ✅ |
@@ -60,7 +62,6 @@ official servers work.
 | `base-files/lib/preinit/01_sysinfo` | Board detection from the DT model (U-Boot reports board type 20006, which OpenWrt calls ITUS_SHIELD) |
 | `base-files/etc/board.d/01_network` | lan1-4 / wan, real MACs from product data |
 | `base-files/lib/upgrade/platform.sh` | sysupgrade writes the `firmware` MTD partition |
-| `base-files/etc/hotplug.d/ieee80211/10_fix_wifi_mac` | Wi-Fi MAC = base + 3 |
 | `files/etc/uci-defaults/90-dsr1000n-wan2-mac` | WAN2 MAC = base + 2 |
 | `files/www/.../15_cpu.js` + rpcd ACL | CPU usage section on the LuCI overview page |
 
@@ -144,6 +145,9 @@ Over the console, stop U-Boot, then either:
 ## Known issues / to do
 
 * WAN2 and Wi-Fi access-point mode not yet tested on hardware.
+* **Save & Apply is slow, not broken.** With one 500 MHz core, a service takes 10–20 s to
+  reload after Save & Apply, and Wi-Fi changes (radio restart, network reload, reconnect,
+  DHCP) can take 30 s or more. Wait before checking whether a change took effect.
 * LuCI names the Wi-Fi card "Ubiquiti SR71A": it reports the Atheros reference subsystem
   ID (168c:2082), which OpenWrt's ID table lists under that name. Cosmetic.
 * Routing throughput is limited by the single 500 MHz core; enable software flow

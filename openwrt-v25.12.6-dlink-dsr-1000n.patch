@@ -171,23 +171,6 @@ index 10af4e8..da7d345
  ubnt,edgerouter-4)
  	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "lan0"
  	;;
-diff --git a/target/linux/octeon/base-files/etc/hotplug.d/ieee80211/10_fix_wifi_mac b/target/linux/octeon/base-files/etc/hotplug.d/ieee80211/10_fix_wifi_mac
-new file mode 100755
-index 0000000..956f013
---- /dev/null
-+++ b/target/linux/octeon/base-files/etc/hotplug.d/ieee80211/10_fix_wifi_mac
-@@ -0,0 +1,11 @@
-+[ "$ACTION" = "add" ] || exit 0
-+
-+. /lib/functions/system.sh
-+
-+case "$(board_name)" in
-+dlink,dsr-1000n)
-+	base_mac=$(mtd_get_mac_text dlink-data 0x20064 12)
-+	[ -n "$base_mac" ] && [ "$PHYNBR" = "0" ] && \
-+		macaddr_add "$base_mac" 3 > /sys${DEVPATH}/macaddress
-+	;;
-+esac
 diff --git a/target/linux/octeon/base-files/lib/preinit/01_sysinfo b/target/linux/octeon/base-files/lib/preinit/01_sysinfo
 old mode 100644
 new mode 100755
