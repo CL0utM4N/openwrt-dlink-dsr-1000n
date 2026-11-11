@@ -1,0 +1,37 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] staging: octeon: cheaper TX bookkeeping
+
+cvm_oct_xmit() is meant to schedule the cleanup tasklet "every 1024
+packets", but tests (total_to_clean & 0x3ff), which is true for 1023 out
+of 1024 packets. Invert it.
+
+It also rewrites the CIU TX poll watchdog timer on every packet. The
+watchdog only exists to free skbs the core still owns; skip the CSR
+write when the PKO frees the buffer itself (QUEUE_HW).
+
+diff -Nurp a/drivers/staging/octeon/ethernet-tx.c b/drivers/staging/octeon/ethernet-tx.c
+--- a/drivers/staging/octeon/ethernet-tx.c	2026-11-11 18:58:22.146272922 +1100
++++ b/drivers/staging/octeon/ethernet-tx.c	2026-11-11 18:58:22.169149704 +1100
+@@ -523,7 +523,7 @@ skip_xmit:
+ 			cvmx_fau_fetch_and_add32(FAU_TOTAL_TX_TO_CLEAN, 1);
+ 	}
+ 
+-	if (total_to_clean & 0x3ff) {
++	if (!(total_to_clean & 0x3ff)) {
+ 		/*
+ 		 * Schedule the cleanup tasklet every 1024 packets for
+ 		 * the pathological case of high traffic on one port
+@@ -533,7 +533,12 @@ skip_xmit:
+ 		tasklet_schedule(&cvm_oct_tx_cleanup_tasklet);
+ 	}
+ 
+-	cvm_oct_kick_tx_poll_watchdog();
++	/*
++	 * The watchdog only exists to free skbs the core still owns; when
++	 * the PKO frees the buffer itself there is nothing to clean up.
++	 */
++	if (queue_type != QUEUE_HW)
++		cvm_oct_kick_tx_poll_watchdog();
+ 
+ 	return NETDEV_TX_OK;
+ }

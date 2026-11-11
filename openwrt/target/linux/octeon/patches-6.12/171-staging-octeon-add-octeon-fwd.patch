@@ -1,0 +1,432 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] staging: octeon: octeon-fwd, forward offloaded flows from RX buffers
+
+Add an optional receive hook to the NAPI loop (cvm_oct_set_rx_hook()) and
+cvm_oct_xmit_fpa_buffer(), which hands a received FPA packet buffer to the
+PKO as is (hardware free back into the receive pool).
+
+octeon-fwd uses them: for packets from a Broadcom-tagged DSA switch it looks
+the flow up in the netfilter flowtable registered on the ingress switch port
+and, on a hit, applies the flowtable's own NAT/TTL/MAC rewrite in place,
+swaps in the Broadcom egress tag and submits the buffer straight to the PKO.
+No skb processing, network stack, DSA, bridge or qdisc layers per packet.
+Flow state, policy, timeouts and counters stay the kernel flowtable's;
+anything not matched takes the normal receive path unchanged.
+
+diff -Nurp a/drivers/staging/octeon/Kconfig b/drivers/staging/octeon/Kconfig
+--- a/drivers/staging/octeon/Kconfig	2026-11-11 20:37:17.551024570 +1100
++++ b/drivers/staging/octeon/Kconfig	2026-11-11 20:37:17.587252078 +1100
+@@ -13,3 +13,11 @@ config OCTEON_ETHERNET
+ 	  To compile this driver as a module, choose M here.  The module
+ 	  will be called octeon-ethernet.
+ 
++config OCTEON_FWD
++	tristate "Forward offloaded flows from RX hardware buffers"
++	depends on OCTEON_ETHERNET && NET_DSA && NF_FLOW_TABLE_INET
++	help
++	  Forward flows already offloaded to a netfilter flowtable directly
++	  from the receive hardware buffer (Broadcom-tagged DSA ports),
++	  bypassing the network stack. Flow state stays in the kernel's
++	  flowtable; everything else takes the normal receive path.
+diff -Nurp a/drivers/staging/octeon/Makefile b/drivers/staging/octeon/Makefile
+--- a/drivers/staging/octeon/Makefile	2026-11-11 20:37:17.547024570 +1100
++++ b/drivers/staging/octeon/Makefile	2026-11-11 20:37:17.587164241 +1100
+@@ -17,3 +17,4 @@ octeon-ethernet-y += ethernet-rx.o
+ octeon-ethernet-y += ethernet-sgmii.o
+ octeon-ethernet-y += ethernet-spi.o
+ octeon-ethernet-y += ethernet-tx.o
++obj-$(CONFIG_OCTEON_FWD) += octeon-fwd.o
+diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ethernet-rx.c
+--- a/drivers/staging/octeon/ethernet-rx.c	2026-11-11 20:37:17.537718104 +1100
++++ b/drivers/staging/octeon/ethernet-rx.c	2026-11-11 20:37:17.586818966 +1100
+@@ -294,6 +294,16 @@ slow:
+ 	return true;
+ }
+ 
++static cvm_oct_rx_hook_t __rcu cvm_oct_rx_hook;
++
++int cvm_oct_set_rx_hook(cvm_oct_rx_hook_t hook)
++{
++	rcu_assign_pointer(cvm_oct_rx_hook, hook);
++	synchronize_net();
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cvm_oct_set_rx_hook);
++
+ static int cvm_oct_poll(struct oct_rx_group *rx_group, int budget)
+ {
+ 	const int	coreid = cvmx_get_core_num();
+@@ -448,6 +458,26 @@ static int cvm_oct_poll(struct oct_rx_gr
+ 			 * currently up.
+ 			 */
+ 			if (likely(dev->flags & IFF_UP)) {
++				if (likely(packet_not_copied)) {
++					cvm_oct_rx_hook_t hook;
++					int r = CVM_OCT_RX_PASS;
++
++					rcu_read_lock();
++					hook = rcu_dereference(cvm_oct_rx_hook);
++					if (hook)
++						r = hook(dev, work, skb);
++					rcu_read_unlock();
++					if (r == CVM_OCT_RX_SENT) {
++						/* buffer owned by the PKO now */
++						cvmx_fpa_free(work, CVMX_FPA_WQE_POOL, 1);
++						continue;
++					}
++					if (r == CVM_OCT_RX_DROP) {
++						dev->stats.rx_dropped++;
++						cvm_oct_free_work(work);
++						continue;
++					}
++				}
+ 				skb->protocol = eth_type_trans(skb, dev);
+ 				skb->dev = dev;
+ 
+diff -Nurp a/drivers/staging/octeon/ethernet-tx.c b/drivers/staging/octeon/ethernet-tx.c
+--- a/drivers/staging/octeon/ethernet-tx.c	2026-11-11 20:37:17.539571964 +1100
++++ b/drivers/staging/octeon/ethernet-tx.c	2026-11-11 20:37:17.587038082 +1100
+@@ -544,6 +544,46 @@ skip_xmit:
+ }
+ 
+ /**
++ * cvm_oct_xmit_fpa_buffer - send a received FPA packet buffer as is
++ * @dev: output port
++ * @buf: buffer pointer from the RX work entry (addr/back/pool as filled by IPD)
++ * @len: frame length
++ *
++ * The PKO frees the buffer back into the FPA packet pool once sent, so the
++ * skb living in front of it is reused by the next receive without being
++ * touched. For forwarding engines that rewrote the frame in place.
++ */
++int cvm_oct_xmit_fpa_buffer(struct net_device *dev, union cvmx_buf_ptr buf,
++			    unsigned int len)
++{
++	struct octeon_ethernet *priv = netdev_priv(dev);
++	union cvmx_pko_command_word0 pko_command;
++	unsigned long flags;
++	int ret = 0;
++
++	pko_command.u64 = 0;
++#ifdef __LITTLE_ENDIAN
++	pko_command.s.le = 1;
++#endif
++	pko_command.s.n2 = 1;	/* Don't pollute L2 with the outgoing packet */
++	pko_command.s.segs = 1;
++	pko_command.s.total_bytes = len;
++	/* dontfree = 0: the hardware returns the buffer to its pool */
++	buf.s.size = len;
++
++	spin_lock_irqsave(&priv->tx_free_list[0].lock, flags);
++	cvmx_pko_send_packet_prepare(priv->port, priv->queue,
++				     CVMX_PKO_LOCK_NONE);
++	if (unlikely(cvmx_pko_send_packet_finish(priv->port, priv->queue,
++						 pko_command, buf,
++						 CVMX_PKO_LOCK_NONE)))
++		ret = -EBUSY;
++	spin_unlock_irqrestore(&priv->tx_free_list[0].lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(cvm_oct_xmit_fpa_buffer);
++
++/**
+  * cvm_oct_xmit_pow - transmit a packet to the POW
+  * @skb:    Packet to send
+  * @dev:    Device info structure
+diff -Nurp a/drivers/staging/octeon/octeon-ethernet.h b/drivers/staging/octeon/octeon-ethernet.h
+--- a/drivers/staging/octeon/octeon-ethernet.h	2026-11-11 20:37:17.541841283 +1100
++++ b/drivers/staging/octeon/octeon-ethernet.h	2026-11-11 20:37:17.586635097 +1100
+@@ -90,6 +90,19 @@ struct octeon_ethernet_platform {
+ 
+ int cvm_oct_free_work(void *work_queue_entry);
+ 
++/*
++ * Optional receive hook for a hardware-buffer forwarding engine (octeon-fwd).
++ * Called from the NAPI loop for zero-copy packets, before the stack sees them.
++ * Returns CVM_OCT_RX_PASS to continue normally, CVM_OCT_RX_SENT if the packet
++ * buffer was handed to the PKO (hardware frees it), CVM_OCT_RX_DROP to drop.
++ */
++enum { CVM_OCT_RX_PASS, CVM_OCT_RX_SENT, CVM_OCT_RX_DROP };
++typedef int (*cvm_oct_rx_hook_t)(struct net_device *dev, struct cvmx_wqe *work,
++				 struct sk_buff *skb);
++int cvm_oct_set_rx_hook(cvm_oct_rx_hook_t hook);
++int cvm_oct_xmit_fpa_buffer(struct net_device *dev, union cvmx_buf_ptr buf,
++			    unsigned int len);
++
+ int cvm_oct_rgmii_open(struct net_device *dev);
+ 
+ int cvm_oct_sgmii_init(struct net_device *dev);
+diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon-fwd.c
+--- a/drivers/staging/octeon/octeon-fwd.c	1970-01-01 10:00:00.000000000 +1000
++++ b/drivers/staging/octeon/octeon-fwd.c	2026-11-11 20:37:17.598243317 +1100
+@@ -0,0 +1,270 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * octeon-fwd: forward offloaded flows straight from the receive hardware
++ * buffer, for Octeon ports behind a Broadcom-tagged DSA switch.
++ *
++ * For every zero-copy packet the octeon-ethernet RX loop receives, this
++ * module looks the flow up in the netfilter flowtable registered on the
++ * ingress switch port (software flow offloading, fw4 on lower devices), and
++ * on a hit rewrites the packet in place (NAT, TTL, MACs, Broadcom egress tag)
++ * and hands the same FPA buffer to the PKO, which frees it back into the
++ * receive pool. No skb processing, no network stack, no DSA/bridge layers.
++ *
++ * Flow state is the kernel's own: which connections are offloaded is still
++ * decided by netfilter, and timeouts, NAT and counters follow the flowtable's
++ * own rules (same checks as nf_flow_offload_ip_hook()). Everything else
++ * (misses, non-IPv4, options, fragments, TCP FIN/RST, MTU, non-direct
++ * transmit paths) passes through unchanged to the normal receive path.
++ */
++
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/if_bridge.h>
++#include <linux/ip.h>
++#include <linux/tcp.h>
++#include <linux/udp.h>
++#include <linux/netfilter.h>
++#include <linux/unaligned.h>
++#include <net/dsa.h>
++#include <net/ip.h>
++#include <net/checksum.h>
++#include <net/netfilter/nf_flow_table.h>
++#include <net/netfilter/nf_conntrack_acct.h>
++
++#include "octeon-ethernet.h"
++
++static bool enable = true;
++module_param(enable, bool, 0644);
++MODULE_PARM_DESC(enable, "Forward offloaded flows from the RX hardware buffer");
++
++static unsigned long hits;
++module_param(hits, ulong, 0444);
++static unsigned long misses;
++module_param(misses, ulong, 0444);
++static unsigned long passed;
++module_param(passed, ulong, 0444);
++
++#define BRCM_TAG_LEN		4
++#define BRCM_ETH_HLEN		(2 * ETH_ALEN + BRCM_TAG_LEN + 2)	/* 18 */
++#define BRCM_OPCODE_SHIFT	5
++#define BRCM_OPCODE_MASK	0x7
++#define BRCM_EG_RC_RSVD		(3 << 6)
++#define BRCM_EG_PID_MASK	0x1f
++#define BRCM_IG_DSTMAP1_MASK	0xff
++
++static struct net_device *fwd_user_port(struct net_device *conduit, int port)
++{
++	struct dsa_port *cpu_dp = conduit->dsa_ptr, *dp;
++
++	if (unlikely(!cpu_dp))
++		return NULL;
++	list_for_each_entry(dp, &cpu_dp->dst->ports, list)
++		if (dp->ds->index == 0 && dp->index == port &&
++		    dp->type == DSA_PORT_TYPE_USER)
++			return dp->user;
++	return NULL;
++}
++
++static struct nf_flowtable *fwd_flowtable(const struct net_device *dev)
++{
++	const struct nf_hook_entries *e = rcu_dereference(dev->nf_hooks_ingress);
++	int i;
++
++	if (!e)
++		return NULL;
++	for (i = 0; i < e->num_hook_entries; i++)
++		if (e->hooks[i].hook == nf_flow_offload_inet_hook)
++			return e->hooks[i].priv;
++	return NULL;
++}
++
++/* Same as nf_flow_snat_ip()/nf_flow_dnat_ip() in nf_flow_table_ip.c */
++static void fwd_nat_l4(struct sk_buff *skb, struct iphdr *iph,
++		       __be32 addr, __be32 new_addr)
++{
++	if (iph->protocol == IPPROTO_TCP) {
++		struct tcphdr *tcph = (void *)(iph + 1);
++
++		inet_proto_csum_replace4(&tcph->check, skb, addr, new_addr, true);
++	} else {
++		struct udphdr *udph = (void *)(iph + 1);
++
++		if (udph->check) {
++			inet_proto_csum_replace4(&udph->check, skb, addr,
++						 new_addr, true);
++			if (!udph->check)
++				udph->check = CSUM_MANGLED_0;
++		}
++	}
++}
++
++static void fwd_nat(const struct flow_offload *flow, struct sk_buff *skb,
++		    struct iphdr *iph, enum flow_offload_tuple_dir dir)
++{
++	__be32 addr, new_addr;
++
++	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
++		nf_flow_snat_port(flow, skb, sizeof(*iph), iph->protocol, dir);
++		if (dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
++			addr = iph->saddr;
++			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple.dst_v4.s_addr;
++			iph->saddr = new_addr;
++		} else {
++			addr = iph->daddr;
++			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.src_v4.s_addr;
++			iph->daddr = new_addr;
++		}
++		csum_replace4(&iph->check, addr, new_addr);
++		fwd_nat_l4(skb, iph, addr, new_addr);
++	}
++	if (test_bit(NF_FLOW_DNAT, &flow->flags)) {
++		nf_flow_dnat_port(flow, skb, sizeof(*iph), iph->protocol, dir);
++		if (dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
++			addr = iph->daddr;
++			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple.src_v4.s_addr;
++			iph->daddr = new_addr;
++		} else {
++			addr = iph->saddr;
++			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.dst_v4.s_addr;
++			iph->saddr = new_addr;
++		}
++		csum_replace4(&iph->check, addr, new_addr);
++		fwd_nat_l4(skb, iph, addr, new_addr);
++	}
++}
++
++static int fwd_rx(struct net_device *dev, struct cvmx_wqe *work,
++		  struct sk_buff *skb)
++{
++	struct flow_offload_tuple tuple = {};
++	struct flow_offload_tuple_rhash *th;
++	enum flow_offload_tuple_dir dir;
++	struct net_device *in, *upper, *out;
++	struct flow_offload *flow;
++	struct nf_flowtable *ft;
++	struct flow_ports *ports;
++	struct dsa_port *odp;
++	unsigned int len = skb->len, tot;
++	struct iphdr *iph;
++	u8 *d = skb->data;
++
++	if (!READ_ONCE(enable) || !netdev_uses_dsa(dev) ||
++	    len < BRCM_ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr))
++		return CVM_OCT_RX_PASS;
++
++	/* Broadcom tag, switch -> CPU direction: opcode 0, then the EtherType */
++	if (((d[12] >> BRCM_OPCODE_SHIFT) & BRCM_OPCODE_MASK) ||
++	    (d[14] & BRCM_EG_RC_RSVD) ||
++	    get_unaligned((__be16 *)(d + 16)) != htons(ETH_P_IP))
++		goto pass;
++
++	iph = (struct iphdr *)(d + BRCM_ETH_HLEN);
++	if (iph->version != 4 || iph->ihl != 5 || ip_is_fragment(iph) ||
++	    iph->ttl <= 1 ||
++	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
++		goto pass;
++	tot = ntohs(iph->tot_len);
++	if (tot + BRCM_ETH_HLEN > len ||
++	    tot < sizeof(*iph) + (iph->protocol == IPPROTO_TCP ?
++				  sizeof(struct tcphdr) : sizeof(struct udphdr)))
++		goto pass;
++
++	in = fwd_user_port(dev, d[15] & BRCM_EG_PID_MASK);
++	if (!in || !(in->flags & IFF_UP))
++		goto pass;
++	upper = in;
++	if (netif_is_bridge_port(in)) {
++		upper = netdev_master_upper_dev_get_rcu(in);
++		if (!upper || br_vlan_enabled(upper))
++			goto pass;
++	}
++	/* only frames addressed to the router are routed */
++	if (!ether_addr_equal(d, upper->dev_addr))
++		goto pass;
++
++	ft = fwd_flowtable(in);
++	if (!ft)
++		goto pass;
++
++	ports = (struct flow_ports *)(iph + 1);
++	tuple.src_v4.s_addr = iph->saddr;
++	tuple.dst_v4.s_addr = iph->daddr;
++	tuple.src_port = ports->source;
++	tuple.dst_port = ports->dest;
++	tuple.l3proto = AF_INET;
++	tuple.l4proto = iph->protocol;
++	tuple.iifidx = in->ifindex;
++
++	th = flow_offload_lookup(ft, &tuple);
++	if (!th) {
++		misses++;
++		return CVM_OCT_RX_PASS;
++	}
++	dir = th->tuple.dir;
++	flow = container_of(th, struct flow_offload, tuplehash[dir]);
++
++	/* same conditions as nf_flow_offload_forward(); else let it decide */
++	if (th->tuple.xmit_type != FLOW_OFFLOAD_XMIT_DIRECT ||
++	    th->tuple.encap_num || tot > th->tuple.mtu)
++		goto pass;
++	if (iph->protocol == IPPROTO_TCP) {
++		struct tcphdr *tcph = (void *)(iph + 1);
++
++		if (tcph->fin || tcph->rst)
++			goto pass;	/* normal path tears the flow down */
++	}
++
++	out = dev_get_by_index_rcu(dev_net(in), th->tuple.out.ifidx);
++	if (!out || !(out->flags & IFF_UP) || !dsa_user_dev_check(out))
++		goto pass;
++	odp = dsa_port_from_netdev(out);
++	if (IS_ERR(odp) || odp->cpu_dp->conduit != dev || odp->ds->index != 0 ||
++	    odp->index > 7)
++		goto pass;
++
++	/* commit: from here on the packet is forwarded or dropped */
++	flow_offload_refresh(ft, flow, false);
++
++	skb_set_network_header(skb, BRCM_ETH_HLEN);
++	skb->ip_summed = CHECKSUM_NONE;
++	fwd_nat(flow, skb, iph, dir);
++	ip_decrease_ttl(iph);
++	if (ft->flags & NF_FLOWTABLE_COUNTER)
++		nf_ct_acct_update(flow->ct, dir, tot);
++
++	memcpy(d, th->tuple.out.h_dest, ETH_ALEN);
++	memcpy(d + ETH_ALEN, th->tuple.out.h_source, ETH_ALEN);
++	/* Broadcom tag, CPU -> switch: forward to exactly this port */
++	d[12] = 1 << BRCM_OPCODE_SHIFT;
++	d[13] = 0;
++	d[14] = 0;
++	d[15] = BIT(odp->index) & BRCM_IG_DSTMAP1_MASK;
++
++	dev_sw_netstats_rx_add(in, len - BRCM_TAG_LEN);
++	dev_sw_netstats_tx_add(out, 1, len - BRCM_TAG_LEN);
++
++	if (unlikely(cvm_oct_xmit_fpa_buffer(dev, work->packet_ptr, len)))
++		return CVM_OCT_RX_DROP;
++	hits++;
++	return CVM_OCT_RX_SENT;
++pass:
++	passed++;
++	return CVM_OCT_RX_PASS;
++}
++
++static int __init octeon_fwd_init(void)
++{
++	return cvm_oct_set_rx_hook(fwd_rx);
++}
++
++static void __exit octeon_fwd_exit(void)
++{
++	cvm_oct_set_rx_hook(NULL);
++}
++
++module_init(octeon_fwd_init);
++module_exit(octeon_fwd_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Forward flowtable-offloaded flows from Octeon RX hardware buffers");

@@ -1,0 +1,48 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] fw4: register software flowtable on bridge/VLAN lower devices
+
+For software flow offloading the flowtable was registered on the zone
+devices themselves (e.g. br-lan). nft_flow_offload then cannot resolve a
+direct transmit path for flows through a bridge, so every offloaded
+packet still goes through the bridge and neighbour output.
+
+Resolve bridge and VLAN devices to their lower devices, as is already
+done for hardware offloading. Flows through a bridge then use direct
+transmit to the port (FLOW_OFFLOAD_XMIT_DIRECT). On a 500 MHz Octeon
+with a DSA switch this raises forwarding from ~67 to ~70.5 kpps.
+
+diff -Nurp a/root/usr/share/ucode/fw4.uc b/root/usr/share/ucode/fw4.uc
+--- a/root/usr/share/ucode/fw4.uc	2026-11-11 18:59:00.905035274 +1100
++++ b/root/usr/share/ucode/fw4.uc	2026-11-11 18:59:00.924019093 +1100
+@@ -423,6 +423,17 @@ function map_setmatch(set, match, proto)
+ 	return fields;
+ }
+ 
++function offload_devstatus() {
++	let bus = ubus.connect(), st = null;
++
++	if (bus) {
++		st = bus.call("network.device", "status");
++		bus.disconnect();
++	}
++
++	return st || {};
++}
++
+ function resolve_lower_devices(devstatus, devname) {
+ 	let dir = fs.opendir(`/sys/class/net/${devname}`);
+ 	let devs = [];
+@@ -545,11 +556,12 @@ return {
+ 
+ 		if (!devices) {
+ 			devices = [];
++			let devstatus = offload_devstatus();
+ 
+ 			for (let zone in this.zones())
+ 				for (let device in zone.related_physdevs)
+ 					if (fs.access(`/sys/class/net/${device}`))
+-						push(devices, device);
++						push(devices, ...resolve_lower_devices(devstatus, device));
+ 
+ 			devices = sort(uniq(devices));
+ 		}

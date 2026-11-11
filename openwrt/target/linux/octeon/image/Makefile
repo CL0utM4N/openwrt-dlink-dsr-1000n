@@ -127,7 +127,7 @@ define Device/dlink_dsr-1000n
   DEVICE_VARIANT := A1
   BOARD_NAME := dlink,dsr-1000n
   DEVICE_DTS := dlink_dsr-1000n
-  DEVICE_PACKAGES += kmod-leds-gpio kmod-ath9k wpad-mbedtls kmod-dsa-b53-mdio kmod-rtc-ds1307 kmod-gpio-button-hotplug kmod-crypto-aes-octeon \
+  DEVICE_PACKAGES += kmod-leds-gpio kmod-ath9k wpad-mbedtls kmod-dsa-b53-mdio kmod-rtc-ds1307 kmod-gpio-button-hotplug kmod-crypto-aes-octeon kmod-octeon-fwd \
 	-kmod-usb-dwc3-octeon -mkf2fs
   KERNEL := kernel-bin | strip-kernel | append-dtb-to-elf
   KERNEL_INITRAMFS := kernel-bin | strip-kernel | append-dtb-to-elf

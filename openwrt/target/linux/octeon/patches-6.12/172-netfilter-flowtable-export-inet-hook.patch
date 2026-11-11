@@ -1,0 +1,38 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: export nf_flow_offload_inet_hook
+
+So a driver-level forwarding engine can find the flowtable registered on a
+device's ingress hook (the hook's priv) and use the flowtable's own state.
+
+diff -Nurp a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+--- a/include/net/netfilter/nf_flow_table.h	2026-11-11 20:37:17.649322160 +1100
++++ b/include/net/netfilter/nf_flow_table.h	2026-11-11 20:37:17.685080613 +1100
+@@ -315,6 +315,8 @@ int nf_flow_offload_xdp_setup(struct nf_
+ 			      struct net_device *dev,
+ 			      enum flow_block_command cmd);
+ 
++unsigned int nf_flow_offload_inet_hook(void *priv, struct sk_buff *skb,
++				       const struct nf_hook_state *state);
+ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 				     const struct nf_hook_state *state);
+ unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+diff -Nurp a/net/netfilter/nf_flow_table_inet.c b/net/netfilter/nf_flow_table_inet.c
+--- a/net/netfilter/nf_flow_table_inet.c	2026-11-11 20:37:17.631024572 +1100
++++ b/net/netfilter/nf_flow_table_inet.c	2026-11-11 20:37:17.684327022 +1100
+@@ -8,7 +8,7 @@
+ #include <net/netfilter/nf_tables.h>
+ #include <linux/if_vlan.h>
+ 
+-static unsigned int
++unsigned int
+ nf_flow_offload_inet_hook(void *priv, struct sk_buff *skb,
+ 			  const struct nf_hook_state *state)
+ {
+@@ -41,6 +41,7 @@ nf_flow_offload_inet_hook(void *priv, st
+ 
+ 	return NF_ACCEPT;
+ }
++EXPORT_SYMBOL_GPL(nf_flow_offload_inet_hook);
+ 
+ static int nf_flow_rule_route_inet(struct net *net,
+ 				   struct flow_offload *flow,

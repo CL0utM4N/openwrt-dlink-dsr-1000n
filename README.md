@@ -63,7 +63,12 @@ official servers work.
 | `patches-6.12/166-staging-octeon-rx-fastpath.patch` | Octeon RX fast path (on by default via `octeon-accel`). Hands established flows straight from the driver's receive loop to the firewall's flowtable (needs software flow offloading on), skipping DSA's GRO pass, a second stack pass and the bridge. `echo 1 > /sys/module/octeon_ethernet/parameters/fastpath`; counters `fastpath_hits/misses/seen`. RAM-boot test: all transfers checksum-correct, ~+10% download / ~+40% upload through a test server on the router itself |
 | `patches-6.12/167-staging-octeon-skb-reuse-switch.patch` | **Buffer reuse:** the PKO frees a transmitted buffer straight back into the hardware RX pool instead of an skb free + reallocation per packet. The driver's old code for this was compiled out with netfilter and its size check no longer matched current kernels; fixed, and the skb is reset to a freshly allocated state before reuse. Runtime switch `skb_reuse`, counter `skb_reused` |
 | `patches-6.12/168-lib-string-aligned-word-memcmp.patch` | Generic `memcmp()` compares a word at a time when both buffers are aligned (MIPS otherwise gets a byte loop); the flowtable's key compare was ~6% of CPU |
-| `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath` and `skb_reuse` at boot (both on); set to `0` and `/etc/init.d/octeon-accel reload` to turn off |
+| `patches-6.12/169-staging-octeon-cheaper-tx-bookkeeping.patch` | TX cleanup tasklet scheduled every 1024 packets as the code comment intends (the test was inverted), and no watchdog CSR write when the hardware frees the buffer |
+| `patches-6.12/171-staging-octeon-add-octeon-fwd.patch` | RX hook + `cvm_oct_xmit_fpa_buffer()` in the driver, and the `octeon-fwd` module (see Performance) |
+| `patches-6.12/172-netfilter-flowtable-export-inet-hook.patch` | Exports `nf_flow_offload_inet_hook` so octeon-fwd can find a port's flowtable |
+| `package/kernel/linux/modules/netdevices.mk` | `kmod-octeon-fwd` package |
+| `package/network/config/firewall4/patches/100-software-offload-on-lower-devices.patch` | fw4 registers the software flowtable on bridge members (`lan1`..`lan4`) instead of `br-lan`, so offloaded flows transmit directly to the port (no bridge, no neighbour lookup) |
+| `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath`, `skb_reuse`, `conduit_noqueue` (no qdisc on `eth0`) and `wqe_fwd` (octeon-fwd) at boot, all on; set an option to `0` and `/etc/init.d/octeon-accel reload` to turn it off |
 | `files/etc/uci-defaults/92-dsr1000n-octeon-accel` | Enables the above and software flow offloading on first boot |
 | `files/etc/uci-defaults/91-dsr1000n-wifi-name` | The stock AR9160 card reports Atheros' reference ID 168c:2082, which OpenWrt's tables call "Ubiquiti SR71A" with a +7 dB TX power offset; corrects that entry to "Atheros AR9160", 0 dB, on this board |
 | `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon` package |
@@ -83,19 +88,49 @@ only the patches (160 and 161 are generic fixes) and the DTS.
 ## Performance
 
 Measured on hardware (single 500 MHz core), NAT between LAN hosts through the router
-(hairpin: every packet takes Octeon RX → flowtable → Octeon TX):
+(hairpin: every packet takes Octeon RX → flowtable → Octeon TX), one direction at a time.
+UDP rates are packets forwarded per second of offered load; full-size frames are offered at
+gigabit line rate (~80.7 kpps).
 
-| Configuration | TCP, both directions at once, data verified | 64-byte UDP |
+| Configuration (cumulative) | 1472-byte UDP | 64-byte UDP |
 |---|---|---|
-| Software flow offloading only | ~265 Mb/s | ~29 kpps |
-| + driver fast path (patch 166) | ~430 Mb/s | ~38–48 kpps |
-| + buffer reuse (patch 167) | ~610 Mb/s | ~53 kpps |
-| + word `memcmp` (patch 168), `CVMSEG_SIZE=2`, no `LOCK_L2` — the default | **~575–705 Mb/s** | **~59 kpps** |
+| Software flow offloading only | — | ~33 kpps |
+| + driver fast path (166), buffer reuse (167), `memcmp` (168), `CVMSEG_SIZE=2`, no `LOCK_L2` | ~66 kpps (~795 Mb/s) | ~67 kpps |
+| + no qdisc on the DSA conduit `eth0` (was `fq_codel`) | ~77 kpps (~925 Mb/s) | — |
+| + flowtable on the switch ports (fw4 patch) | 80.7 kpps, zero loss: line rate (~970 Mb/s) | ~115–120 kpps |
+| + **octeon-fwd** (171/172): forwarding from the RX hardware buffer, the default | **80.7 kpps, line rate** | **~255–265 kpps** |
 
-The last row's three changes only pay off once buffer reuse has removed the per-packet
-allocation cost; measured with reuse off they made no difference. `CVMSEG_SIZE=2` enables the
-driver's asynchronous IOBDMA work requests; disabling `LOCK_L2` leaves the whole 128 KB L2
-cache to packet data.
+TCP through NAT (multiple streams): **~917 Mb/s**, 97.5% of the ~941 Mb/s TCP maximum on
+gigabit; single stream ~870 Mb/s; with data verification (64 MB each way) ~800–820 Mb/s.
+Latency added by the router: ~0.15 ms median idle.
+
+### octeon-fwd
+
+`kmod-octeon-fwd` hooks the octeon-ethernet RX loop before the network stack. For packets from
+the Broadcom-tagged switch it looks the flow up in the **kernel's own flowtable** (the one fw4
+registers on the switch ports), applies the flowtable's NAT/TTL/MAC rewrite in place, writes the
+Broadcom egress tag and hands the same FPA buffer to the PKO, which frees it back into the RX
+pool. No skb processing, network stack, DSA, bridge or qdisc per packet. Policy, flow setup,
+timeouts and counters stay netfilter's; anything not matched (new connections, non-IPv4, IP
+options, fragments, TCP FIN/RST, MTU, non-direct paths, Wi-Fi) takes the normal path unchanged.
+Counters: `/sys/module/octeon_fwd/parameters/{hits,misses,passed}`; off switch `enable`, or
+`option wqe_fwd '0'` in `/etc/config/octeon_accel`. Tested: checksum-verified TCP, unload and
+reload under a 218 kpps flood, live on/off, no leaks.
+
+Notes:
+* Full-size forwarding is limited by the gigabit link, not the CPU; small packets are CPU bound
+  (99% softirq).
+* Latency under load in the hairpin test (~14 ms) sits on the test PC: shrinking the router's
+  buffer pool to 256 did not change it.
+* 168, `CVMSEG_SIZE=2` (async IOBDMA work requests) and no `LOCK_L2` (whole 128 KB L2 for packet
+  data) only pay off once buffer reuse has removed the per-packet allocation cost.
+* Tried and not kept: NAPI weight 64/128 (no gain / unstable), 2048–4096 packet buffers (no
+  gain), conntrack accounting off (no gain), bypassing `__dev_queue_xmit()` for the DSA conduit
+  (−7% on small packets), `receive_group_order=1` (−30% on small packets on one core).
+* The WQE-level idea comes from D-Link's own firmware and from
+  [octeon-flowtable](https://github.com/packerlschupfer/octeon-flowtable) (dual-core CN5020,
+  separate flow engine); octeon-fwd is a separate implementation that reuses the kernel
+  flowtable instead of keeping its own flow state.
 
 ## Build
 

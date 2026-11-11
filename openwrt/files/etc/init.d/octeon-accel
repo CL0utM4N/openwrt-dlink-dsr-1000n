@@ -1,23 +1,41 @@
 #!/bin/sh /etc/rc.common
-# Octeon Ethernet forwarding accelerations (patches 166/167), configured in
-# /etc/config/octeon_accel:
-#   fastpath  - hand offloaded flows to the flowtable straight from the RX loop
-#               (needs Network -> Firewall -> Software flow offloading)
-#   skb_reuse - return transmitted buffers directly to the hardware RX pool
-# Both default to on. "/etc/init.d/octeon-accel reload" applies changes.
+# Octeon Ethernet forwarding accelerations, configured in /etc/config/octeon_accel:
+#   fastpath        - hand offloaded flows to the flowtable straight from the RX
+#                     loop (needs Network -> Firewall -> Software flow offloading)
+#   skb_reuse       - return transmitted buffers directly to the hardware RX pool
+#   conduit_noqueue - no qdisc on the DSA conduit (eth0). Every port already has
+#                     its own device; put SQM/cake on the WAN port if wanted.
+#   wqe_fwd         - octeon-fwd: forward offloaded flows straight from the RX
+#                     hardware buffer (kmod-octeon-fwd)
+# All default to on. "/etc/init.d/octeon-accel reload" applies changes.
 
 START=19
 
 apply() {
 	local p=/sys/module/octeon_ethernet/parameters
-	local fastpath skb_reuse
+	local fastpath skb_reuse noqueue wqe dev
 
 	[ -d "$p" ] || return 0
 	config_load octeon_accel
 	config_get_bool fastpath main fastpath 1
 	config_get_bool skb_reuse main skb_reuse 1
+	config_get_bool noqueue main conduit_noqueue 1
+	config_get_bool wqe main wqe_fwd 1
 	[ -w "$p/fastpath" ] && echo "$fastpath" > "$p/fastpath"
 	[ -w "$p/skb_reuse" ] && echo "$skb_reuse" > "$p/skb_reuse"
+	[ -w /sys/module/octeon_fwd/parameters/enable ] &&
+		echo "$wqe" > /sys/module/octeon_fwd/parameters/enable
+
+	command -v tc >/dev/null || return 0
+	for dev in /sys/class/net/*/dsa; do
+		[ -d "$dev" ] || continue
+		dev="${dev%/dsa}"; dev="${dev##*/}"
+		if [ "$noqueue" = 1 ]; then
+			tc qdisc replace dev "$dev" root noqueue 2>/dev/null
+		else
+			tc qdisc del dev "$dev" root 2>/dev/null
+		fi
+	done
 	return 0
 }
 

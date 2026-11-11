@@ -12,8 +12,8 @@ Off by default: echo 1 > /sys/module/octeon_ethernet/parameters/fastpath
 Counters: fastpath_hits, fastpath_misses in the same directory.
 
 diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ethernet-rx.c
---- a/drivers/staging/octeon/ethernet-rx.c	2026-11-11 13:08:10.962316009 +1100
-+++ b/drivers/staging/octeon/ethernet-rx.c	2026-11-11 13:08:10.981888716 +1100
+--- a/drivers/staging/octeon/ethernet-rx.c	2026-11-11 18:58:13.234171492 +1100
++++ b/drivers/staging/octeon/ethernet-rx.c	2026-11-11 18:58:13.254399973 +1100
 @@ -19,6 +19,10 @@
  #include <linux/smp.h>
  #include <linux/interrupt.h>
@@ -25,7 +25,7 @@ diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ether
  #ifdef CONFIG_XFRM
  #include <linux/xfrm.h>
  #include <net/xfrm.h>
-@@ -176,6 +180,112 @@ static void copy_segments_to_skb(struct
+@@ -176,6 +180,120 @@ static void copy_segments_to_skb(struct
  	}
  }
  
@@ -54,7 +54,7 @@ diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ether
 +/* Returns true if the skb was consumed (forwarded, delivered or freed). */
 +static bool cvm_oct_fastpath_rx(struct sk_buff *skb)
 +{
-+	struct net_device *dev = skb->dev, *user = dev, *target;
++	struct net_device *dev = skb->dev, *user = dev, *target, *upper;
 +	struct sk_buff *nskb;
 +	int ret;
 +
@@ -102,14 +102,22 @@ diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ether
 +	    skb->protocol != htons(ETH_P_IPV6))
 +		goto slow;
 +
++	/*
++	 * The flowtable may be registered on the port itself (direct
++	 * transmit, preferred) or on the bridge above it. Either way only
++	 * frames addressed to the router (the bridge's MAC for a bridge
++	 * port) can be routed.
++	 */
 +	target = user;
++	upper = user;
 +	if (netif_is_bridge_port(user)) {
-+		target = netdev_master_upper_dev_get_rcu(user);
-+		if (!target || br_vlan_enabled(target))
++		upper = netdev_master_upper_dev_get_rcu(user);
++		if (!upper || br_vlan_enabled(upper))
 +			goto slow;
++		if (!rcu_access_pointer(user->nf_hooks_ingress))
++			target = upper;
 +	}
-+	/* only frames the router itself would route */
-+	if (!ether_addr_equal(eth_hdr(skb)->h_dest, target->dev_addr))
++	if (!ether_addr_equal(eth_hdr(skb)->h_dest, upper->dev_addr))
 +		goto slow;
 +
 +	skb->dev = target;
@@ -138,7 +146,7 @@ diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ether
  static int cvm_oct_poll(struct oct_rx_group *rx_group, int budget)
  {
  	const int	coreid = cvmx_get_core_num();
-@@ -346,7 +456,11 @@ static int cvm_oct_poll(struct oct_rx_gr
+@@ -346,7 +464,11 @@ static int cvm_oct_poll(struct oct_rx_gr
  					dev->stats.rx_packets++;
  					dev->stats.rx_bytes += skb->len;
  				}
