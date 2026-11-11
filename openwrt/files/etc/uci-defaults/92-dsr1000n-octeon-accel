@@ -1,0 +1,14 @@
+#!/bin/sh
+# Enable the Octeon forwarding accelerations at boot, and software flow
+# offloading (the fast path builds on it), on the DSR-1000N.
+
+. /lib/functions.sh
+[ "$(board_name)" = "dlink,dsr-1000n" ] || exit 0
+
+/etc/init.d/octeon-accel enable
+
+if [ -z "$(uci -q get firewall.@defaults[0].flow_offloading)" ]; then
+	uci -q set firewall.@defaults[0].flow_offloading='1'
+	uci -q commit firewall
+fi
+exit 0

@@ -1,0 +1,29 @@
+#!/bin/sh
+# The DSR-1000N's stock AR9160 mini-PCI card reports the Atheros reference
+# subsystem ID 168c:2082. OpenWrt's Wi-Fi hardware tables list that ID as
+# "Ubiquiti SR71A" with a +7 dB TX power offset (the SR71A's external
+# amplifier), so LuCI showed the wrong card name and a TX power 7 dB too high.
+# Correct that one entry, on this board only, in both tables:
+#   /usr/share/libiwinfo/devices.txt  (libiwinfo: LuCI, ubus iwinfo)
+#   /usr/share/wifi_devices.json      (ucode iwinfo CLI)
+
+. /lib/functions.sh
+[ "$(board_name)" = "dlink,dsr-1000n" ] || exit 0
+
+fix() {
+	local f="$1" from="$2" to="$3"
+	[ -f "$f" ] || return 0
+	grep -q "$from" "$f" || return 0
+	sed "s/$from/$to/" "$f" > /tmp/wifiname.$$ && cat /tmp/wifiname.$$ > "$f"
+	rm -f /tmp/wifiname.$$
+}
+
+fix /usr/share/libiwinfo/devices.txt \
+	'^0x168c 0x0027 0x168c 0x2082 .*"SR71A"$' \
+	'0x168c 0x0027 0x168c 0x2082    0      0  "Atheros" "AR9160"'
+
+fix /usr/share/wifi_devices.json \
+	'\[ "0x168c", "0x0027", "0x168c", "0x2082", 7, 0, "Ubiquiti", "SR71A" \]' \
+	'[ "0x168c", "0x0027", "0x168c", "0x2082", 0, 0, "Atheros", "AR9160" ]'
+
+exit 0

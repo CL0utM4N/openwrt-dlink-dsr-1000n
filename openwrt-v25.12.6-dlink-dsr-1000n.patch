@@ -1,3 +1,44 @@
+diff --git a/files/etc/config/octeon_accel b/files/etc/config/octeon_accel
+new file mode 100755
+index 0000000..2da86b2
+--- /dev/null
++++ b/files/etc/config/octeon_accel
+@@ -0,0 +1,4 @@
++
++config octeon_accel 'main'
++	option fastpath '1'
++	option skb_reuse '1'
+diff --git a/files/etc/init.d/octeon-accel b/files/etc/init.d/octeon-accel
+new file mode 100755
+index 0000000..865e605
+--- /dev/null
++++ b/files/etc/init.d/octeon-accel
+@@ -0,0 +1,25 @@
++#!/bin/sh /etc/rc.common
++# Octeon Ethernet forwarding accelerations (patches 166/167), configured in
++# /etc/config/octeon_accel:
++#   fastpath  - hand offloaded flows to the flowtable straight from the RX loop
++#               (needs Network -> Firewall -> Software flow offloading)
++#   skb_reuse - return transmitted buffers directly to the hardware RX pool
++# Both default to on. "/etc/init.d/octeon-accel reload" applies changes.
++
++START=19
++
++apply() {
++	local p=/sys/module/octeon_ethernet/parameters
++	local fastpath skb_reuse
++
++	[ -d "$p" ] || return 0
++	config_load octeon_accel
++	config_get_bool fastpath main fastpath 1
++	config_get_bool skb_reuse main skb_reuse 1
++	[ -w "$p/fastpath" ] && echo "$fastpath" > "$p/fastpath"
++	[ -w "$p/skb_reuse" ] && echo "$skb_reuse" > "$p/skb_reuse"
++	return 0
++}
++
++start() { apply; }
++reload() { apply; }
 diff --git a/files/etc/uci-defaults/90-dsr1000n-wan2-mac b/files/etc/uci-defaults/90-dsr1000n-wan2-mac
 new file mode 100755
 index 0000000..bb8a872
@@ -20,6 +61,61 @@ index 0000000..bb8a872
 +uci set network.$s.name='wan2'
 +uci set network.$s.macaddr="$mac"
 +uci commit network
++exit 0
+diff --git a/files/etc/uci-defaults/91-dsr1000n-wifi-name b/files/etc/uci-defaults/91-dsr1000n-wifi-name
+new file mode 100755
+index 0000000..36a3e8e
+--- /dev/null
++++ b/files/etc/uci-defaults/91-dsr1000n-wifi-name
+@@ -0,0 +1,29 @@
++#!/bin/sh
++# The DSR-1000N's stock AR9160 mini-PCI card reports the Atheros reference
++# subsystem ID 168c:2082. OpenWrt's Wi-Fi hardware tables list that ID as
++# "Ubiquiti SR71A" with a +7 dB TX power offset (the SR71A's external
++# amplifier), so LuCI showed the wrong card name and a TX power 7 dB too high.
++# Correct that one entry, on this board only, in both tables:
++#   /usr/share/libiwinfo/devices.txt  (libiwinfo: LuCI, ubus iwinfo)
++#   /usr/share/wifi_devices.json      (ucode iwinfo CLI)
++
++. /lib/functions.sh
++[ "$(board_name)" = "dlink,dsr-1000n" ] || exit 0
++
++fix() {
++	local f="$1" from="$2" to="$3"
++	[ -f "$f" ] || return 0
++	grep -q "$from" "$f" || return 0
++	sed "s/$from/$to/" "$f" > /tmp/wifiname.$$ && cat /tmp/wifiname.$$ > "$f"
++	rm -f /tmp/wifiname.$$
++}
++
++fix /usr/share/libiwinfo/devices.txt \
++	'^0x168c 0x0027 0x168c 0x2082 .*"SR71A"$' \
++	'0x168c 0x0027 0x168c 0x2082    0      0  "Atheros" "AR9160"'
++
++fix /usr/share/wifi_devices.json \
++	'\[ "0x168c", "0x0027", "0x168c", "0x2082", 7, 0, "Ubiquiti", "SR71A" \]' \
++	'[ "0x168c", "0x0027", "0x168c", "0x2082", 0, 0, "Atheros", "AR9160" ]'
++
++exit 0
+diff --git a/files/etc/uci-defaults/92-dsr1000n-octeon-accel b/files/etc/uci-defaults/92-dsr1000n-octeon-accel
+new file mode 100755
+index 0000000..0086c63
+--- /dev/null
++++ b/files/etc/uci-defaults/92-dsr1000n-octeon-accel
+@@ -0,0 +1,14 @@
++#!/bin/sh
++# Enable the Octeon forwarding accelerations at boot, and software flow
++# offloading (the fast path builds on it), on the DSR-1000N.
++
++. /lib/functions.sh
++[ "$(board_name)" = "dlink,dsr-1000n" ] || exit 0
++
++/etc/init.d/octeon-accel enable
++
++if [ -z "$(uci -q get firewall.@defaults[0].flow_offloading)" ]; then
++	uci -q set firewall.@defaults[0].flow_offloading='1'
++	uci -q commit firewall
++fi
 +exit 0
 diff --git a/files/usr/share/rpcd/acl.d/luci-mod-status-index-cpu.json b/files/usr/share/rpcd/acl.d/luci-mod-status-index-cpu.json
 new file mode 100755
@@ -258,14 +354,15 @@ index 62f97e8..1a48d1a 100755
 diff --git a/target/linux/octeon/config-6.12 b/target/linux/octeon/config-6.12
 old mode 100644
 new mode 100755
-index 563388d..3b4260b
+index 563388d..6d42cfe
 --- a/target/linux/octeon/config-6.12
 +++ b/target/linux/octeon/config-6.12
-@@ -1,3 +1,59 @@
+@@ -1,3 +1,60 @@
 +# CONFIG_AT803X_PHY is not set
 +# CONFIG_ATA is not set
 +# CONFIG_BLK_DEV_THROTTLING is not set
 +# CONFIG_CAVIUM_CN63XXP1 is not set
++# CONFIG_CAVIUM_OCTEON_LOCK_L2 is not set
 +# CONFIG_CGROUP_RDMA is not set
 +# CONFIG_COMMON_CLK is not set
 +# CONFIG_CRAMFS is not set
@@ -321,7 +418,7 @@ index 563388d..3b4260b
  CONFIG_64BIT=y
  CONFIG_AHCI_OCTEON=y
  CONFIG_ARCH_DMA_ADDR_T_64BIT=y
-@@ -9,14 +65,13 @@ CONFIG_ARCH_MMAP_RND_BITS_MIN=12
+@@ -9,26 +66,18 @@ CONFIG_ARCH_MMAP_RND_BITS_MIN=12
  CONFIG_ARCH_MMAP_RND_COMPAT_BITS_MAX=15
  CONFIG_ARCH_SPARSEMEM_ENABLE=y
  CONFIG_ARCH_SUSPEND_POSSIBLE=y
@@ -335,10 +432,15 @@ index 563388d..3b4260b
  CONFIG_BUFFER_HEAD=y
  CONFIG_BUILTIN_DTB=y
 -CONFIG_CAVIUM_CN63XXP1=y
- CONFIG_CAVIUM_OCTEON_CVMSEG_SIZE=0
- CONFIG_CAVIUM_OCTEON_LOCK_L2=y
- CONFIG_CAVIUM_OCTEON_LOCK_L2_EXCEPTION=y
-@@ -28,7 +83,6 @@ CONFIG_CAVIUM_OCTEON_SOC=y
+-CONFIG_CAVIUM_OCTEON_CVMSEG_SIZE=0
+-CONFIG_CAVIUM_OCTEON_LOCK_L2=y
+-CONFIG_CAVIUM_OCTEON_LOCK_L2_EXCEPTION=y
+-CONFIG_CAVIUM_OCTEON_LOCK_L2_INTERRUPT=y
+-CONFIG_CAVIUM_OCTEON_LOCK_L2_LOW_LEVEL_INTERRUPT=y
+-CONFIG_CAVIUM_OCTEON_LOCK_L2_MEMCPY=y
+-CONFIG_CAVIUM_OCTEON_LOCK_L2_TLB=y
++CONFIG_CAVIUM_OCTEON_CVMSEG_SIZE=2
+ CONFIG_CAVIUM_OCTEON_SOC=y
  CONFIG_CAVIUM_RESERVE32=0
  CONFIG_CEVT_R4K=y
  CONFIG_CLONE_BACKWARDS=y
@@ -346,7 +448,7 @@ index 563388d..3b4260b
  CONFIG_COMPACT_UNEVICTABLE_DEFAULT=1
  CONFIG_COMPAT_32BIT_TIME=y
  CONFIG_CONTEXT_TRACKING=y
-@@ -50,7 +104,6 @@ CONFIG_CPU_SUPPORTS_64BIT_KERNEL=y
+@@ -50,7 +99,6 @@ CONFIG_CPU_SUPPORTS_64BIT_KERNEL=y
  CONFIG_CPU_SUPPORTS_HIGHMEM=y
  CONFIG_CPU_SUPPORTS_HUGEPAGES=y
  CONFIG_CPU_SUPPORTS_VZ=y
@@ -354,7 +456,7 @@ index 563388d..3b4260b
  CONFIG_CRC16=y
  CONFIG_CRYPTO_CRC32=y
  CONFIG_CRYPTO_CRC32C=y
-@@ -60,11 +113,6 @@ CONFIG_CRYPTO_LIB_GF128MUL=y
+@@ -60,11 +108,6 @@ CONFIG_CRYPTO_LIB_GF128MUL=y
  CONFIG_CRYPTO_LIB_POLY1305_RSIZE=2
  CONFIG_CRYPTO_LIB_SHA1=y
  CONFIG_CRYPTO_LIB_UTILS=y
@@ -366,7 +468,7 @@ index 563388d..3b4260b
  CONFIG_DEBUG_INFO_NONE=y
  CONFIG_DEPRECATED_IRQ_CPU_ONOFFLINE=y
  CONFIG_DMA_NEED_SYNC=y
-@@ -73,17 +121,14 @@ CONFIG_DTC=y
+@@ -73,17 +116,14 @@ CONFIG_DTC=y
  CONFIG_EARLY_PRINTK=y
  CONFIG_EDAC=y
  CONFIG_EDAC_ATOMIC_SCRUB=y
@@ -384,7 +486,7 @@ index 563388d..3b4260b
  CONFIG_FAT_FS=y
  CONFIG_FIXED_PHY=y
  CONFIG_FS_IOMAP=y
-@@ -147,27 +192,23 @@ CONFIG_MIPS_ELF_APPENDED_DTB=y
+@@ -147,27 +187,23 @@ CONFIG_MIPS_ELF_APPENDED_DTB=y
  CONFIG_MIPS_FP_SUPPORT=y
  CONFIG_MIPS_L1_CACHE_SHIFT=7
  CONFIG_MIPS_L1_CACHE_SHIFT_7=y
@@ -415,7 +517,7 @@ index 563388d..3b4260b
  CONFIG_NET_EGRESS=y
  CONFIG_NET_FLOW_LIMIT=y
  CONFIG_NET_INGRESS=y
-@@ -177,14 +218,10 @@ CONFIG_NLS=y
+@@ -177,14 +213,10 @@ CONFIG_NLS=y
  CONFIG_NLS_CODEPAGE_437=y
  CONFIG_NLS_ISO8859_1=y
  CONFIG_NO_GENERIC_PCI_IOPORT_MAP=y
@@ -430,7 +532,7 @@ index 563388d..3b4260b
  CONFIG_OCTEON_WDT=y
  CONFIG_OF=y
  CONFIG_OF_ADDRESS=y
-@@ -198,12 +235,7 @@ CONFIG_PADATA=y
+@@ -198,12 +230,7 @@ CONFIG_PADATA=y
  CONFIG_PAGE_POOL=y
  CONFIG_PAGE_SIZE_LESS_THAN_256KB=y
  CONFIG_PAGE_SIZE_LESS_THAN_64KB=y
@@ -443,7 +545,7 @@ index 563388d..3b4260b
  CONFIG_PCI_DOMAINS=y
  CONFIG_PCI_DRIVERS_LEGACY=y
  CONFIG_PERF_USE_VMALLOC=y
-@@ -213,33 +245,24 @@ CONFIG_PHYLIB_LEDS=y
+@@ -213,33 +240,24 @@ CONFIG_PHYLIB_LEDS=y
  CONFIG_PHYLINK=y
  CONFIG_PHYS_ADDR_T_64BIT=y
  CONFIG_PTP_1588_CLOCK_OPTIONAL=y
@@ -477,7 +579,7 @@ index 563388d..3b4260b
  CONFIG_SPLIT_PTE_PTLOCKS=y
  CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU=y
  CONFIG_SWIOTLB=y
-@@ -261,21 +284,15 @@ CONFIG_TREE_SRCU=y
+@@ -261,21 +279,15 @@ CONFIG_TREE_SRCU=y
  CONFIG_USB=y
  CONFIG_USB_COMMON=y
  CONFIG_USB_EHCI_BIG_ENDIAN_MMIO=y
@@ -1378,3 +1480,171 @@ index 0000000..41075f6
 + 			} else {
 + 				/*
 + 				 * Drop any packet received for a device that
+diff --git a/target/linux/octeon/patches-6.12/167-staging-octeon-skb-reuse-switch.patch b/target/linux/octeon/patches-6.12/167-staging-octeon-skb-reuse-switch.patch
+new file mode 100755
+index 0000000..1452889
+--- /dev/null
++++ b/target/linux/octeon/patches-6.12/167-staging-octeon-skb-reuse-switch.patch
+@@ -0,0 +1,113 @@
++From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
++Subject: [PATCH] staging: octeon: runtime switch for TX skb reuse
++
++REUSE_SKBUFFS_WITHOUT_FREE lets the PKO free a transmitted skb's buffer
++straight back into the FPA receive pool, saving an skb free plus an RX
++refill allocation per forwarded packet. It was compiled out whenever
++netfilter was enabled because stale per-packet state could leak into the
++next received packet, and its truesize check still used an old formula,
++so with current kernels no skb ever qualified.
++
++Compile it in, gate it with a runtime parameter (default off), and reset
++the skb to a freshly allocated state (as the core NAPI skb cache does)
++before the buffer is handed to the hardware. Fix the truesize check
++(SKB_TRUESIZE) and count reused skbs (skb_reused parameter).
++
++echo 1 > /sys/module/octeon_ethernet/parameters/skb_reuse
++diff -Nurp a/drivers/staging/octeon/ethernet-defines.h b/drivers/staging/octeon/ethernet-defines.h
++--- a/drivers/staging/octeon/ethernet-defines.h	2026-11-11 15:23:19.339921338 +1100
+++++ b/drivers/staging/octeon/ethernet-defines.h	2026-11-11 15:19:43.624365112 +1100
++@@ -21,11 +21,12 @@
++ #ifndef __ETHERNET_DEFINES_H__
++ #define __ETHERNET_DEFINES_H__
++ 
++-#ifdef CONFIG_NETFILTER
++-#define REUSE_SKBUFFS_WITHOUT_FREE	0
++-#else
+++/*
+++ * Compiled in always; enabled at runtime with the skb_reuse module parameter.
+++ * The reuse path resets all per-packet state before a buffer goes back to
+++ * the hardware pool, so it is safe with netfilter.
+++ */
++ #define REUSE_SKBUFFS_WITHOUT_FREE	1
++-#endif
++ 
++ #define USE_ASYNC_IOBDMA		(CONFIG_CAVIUM_OCTEON_CVMSEG_SIZE > 0)
++ 
++diff -Nurp a/drivers/staging/octeon/ethernet-tx.c b/drivers/staging/octeon/ethernet-tx.c
++--- a/drivers/staging/octeon/ethernet-tx.c	2026-11-11 15:23:19.339870926 +1100
+++++ b/drivers/staging/octeon/ethernet-tx.c	2026-11-11 15:20:26.854922428 +1100
++@@ -27,6 +27,34 @@
++ #include "ethernet-tx.h"
++ #include "ethernet-util.h"
++ 
+++static bool skb_reuse;
+++module_param(skb_reuse, bool, 0644);
+++MODULE_PARM_DESC(skb_reuse, "Return transmitted skbs straight to the hardware RX pool");
+++static unsigned long skb_reused;
+++module_param(skb_reused, ulong, 0444);
+++
+++/*
+++ * Make an skb that goes back to the FPA pool look freshly allocated, the
+++ * way the core's NAPI skb cache does, so no state from the transmitted
+++ * packet (mark, priority, cb, GSO info, ...) leaks into the next receive.
+++ */
+++static void cvm_oct_skb_reinit(struct sk_buff *skb)
+++{
+++	struct skb_shared_info *shinfo = skb_shinfo(skb);
+++	u8 head_frag = skb->head_frag;
+++	u8 pfmemalloc = skb->pfmemalloc;
+++	u8 pp_recycle = skb->pp_recycle;
+++
+++	memset(skb, 0, offsetof(struct sk_buff, tail));
+++	skb->head_frag = head_frag;
+++	skb->pfmemalloc = pfmemalloc;
+++	skb->pp_recycle = pp_recycle;
+++	skb->mac_header = (typeof(skb->mac_header))~0U;
+++	skb->transport_header = (typeof(skb->transport_header))~0U;
+++	skb->alloc_cpu = raw_smp_processor_id();
+++	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+++}
+++
++ #define CVM_OCT_SKB_CB(skb)	((u64 *)((skb)->cb))
++ 
++ /*
++@@ -294,6 +322,8 @@ netdev_tx_t cvm_oct_xmit(struct sk_buff
++ 	 * shown a 25% increase in performance under some loads.
++ 	 */
++ #if REUSE_SKBUFFS_WITHOUT_FREE
+++	if (!READ_ONCE(skb_reuse))
+++		goto dont_put_skbuff_in_hw;
++ 	fpa_head = skb->head + 256 - ((unsigned long)skb->head & 0x7f);
++ 	if (unlikely(skb->data < fpa_head)) {
++ 		/* TX buffer beginning can't meet FPA alignment constraints */
++@@ -324,9 +354,7 @@ netdev_tx_t cvm_oct_xmit(struct sk_buff
++ 		/* TX buffer has fragments */
++ 		goto dont_put_skbuff_in_hw;
++ 	}
++-	if (unlikely
++-	    (skb->truesize !=
++-	     sizeof(*skb) + skb_end_offset(skb))) {
+++	if (unlikely(skb->truesize != SKB_TRUESIZE(skb_end_offset(skb)))) {
++ 		/* TX buffer truesize has been changed */
++ 		goto dont_put_skbuff_in_hw;
++ 	}
++@@ -404,6 +432,18 @@ dont_put_skbuff_in_hw:
++ 		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH,
++ 					       FAU_TOTAL_TX_TO_CLEAN, 1);
++ 
+++#if REUSE_SKBUFFS_WITHOUT_FREE
+++	/*
+++	 * The hardware will free this buffer into the RX pool once sent:
+++	 * reset the skb now, before the packet is handed to the PKO, so the
+++	 * RX path can never see stale state.
+++	 */
+++	if (!pko_command.s.dontfree) {
+++		cvm_oct_skb_reinit(skb);
+++		skb_reused++;
+++	}
+++#endif
+++
++ 	spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
++ 
++ 	/* Drop this packet if we have too many already queued to the HW */
+diff --git a/target/linux/octeon/patches-6.12/168-lib-string-aligned-word-memcmp.patch b/target/linux/octeon/patches-6.12/168-lib-string-aligned-word-memcmp.patch
+new file mode 100755
+index 0000000..898a893
+--- /dev/null
++++ b/target/linux/octeon/patches-6.12/168-lib-string-aligned-word-memcmp.patch
+@@ -0,0 +1,43 @@
++From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
++Subject: [PATCH] lib/string: word-at-a-time memcmp for aligned buffers
++
++The generic memcmp() only compares a word at a time on architectures with
++CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS; everyone else (e.g. MIPS) gets a
++byte loop. Profiling NAT forwarding on an Octeon (flowtable offload) shows
++~6% of CPU time in memcmp(), from the rhashtable key compare of aligned
++flow tuples. Use a word loop when both pointers are word aligned; the
++byte loop still resolves the first differing word, so results are
++unchanged.
++
++diff -Nurp a/lib/string.c b/lib/string.c
++--- a/lib/string.c	2026-11-11 15:20:35.613129217 +1100
+++++ b/lib/string.c	2026-11-11 15:20:35.632835300 +1100
++@@ -678,6 +678,28 @@ __visible int memcmp(const void *cs, con
++ 		cs = u1;
++ 		ct = u2;
++ 	}
+++#else
+++	/*
+++	 * Without fast unaligned access, still compare a word at a time when
+++	 * both buffers are word aligned (struct keys, e.g. the flowtable and
+++	 * rhashtable lookups). The byte loop below resolves the first
+++	 * differing word, so the result is unchanged.
+++	 */
+++	if (count >= sizeof(unsigned long) &&
+++	    IS_ALIGNED((unsigned long)cs | (unsigned long)ct,
+++		       sizeof(unsigned long))) {
+++		const unsigned long *u1 = cs;
+++		const unsigned long *u2 = ct;
+++		do {
+++			if (*u1 != *u2)
+++				break;
+++			u1++;
+++			u2++;
+++			count -= sizeof(unsigned long);
+++		} while (count >= sizeof(unsigned long));
+++		cs = u1;
+++		ct = u2;
+++	}
++ #endif
++ 	for (su1 = cs, su2 = ct; 0 < count; ++su1, ++su2, count--)
++ 		if ((res = *su1 - *su2) != 0)

@@ -1,0 +1,113 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] staging: octeon: runtime switch for TX skb reuse
+
+REUSE_SKBUFFS_WITHOUT_FREE lets the PKO free a transmitted skb's buffer
+straight back into the FPA receive pool, saving an skb free plus an RX
+refill allocation per forwarded packet. It was compiled out whenever
+netfilter was enabled because stale per-packet state could leak into the
+next received packet, and its truesize check still used an old formula,
+so with current kernels no skb ever qualified.
+
+Compile it in, gate it with a runtime parameter (default off), and reset
+the skb to a freshly allocated state (as the core NAPI skb cache does)
+before the buffer is handed to the hardware. Fix the truesize check
+(SKB_TRUESIZE) and count reused skbs (skb_reused parameter).
+
+echo 1 > /sys/module/octeon_ethernet/parameters/skb_reuse
+diff -Nurp a/drivers/staging/octeon/ethernet-defines.h b/drivers/staging/octeon/ethernet-defines.h
+--- a/drivers/staging/octeon/ethernet-defines.h	2026-11-11 15:23:19.339921338 +1100
++++ b/drivers/staging/octeon/ethernet-defines.h	2026-11-11 15:19:43.624365112 +1100
+@@ -21,11 +21,12 @@
+ #ifndef __ETHERNET_DEFINES_H__
+ #define __ETHERNET_DEFINES_H__
+ 
+-#ifdef CONFIG_NETFILTER
+-#define REUSE_SKBUFFS_WITHOUT_FREE	0
+-#else
++/*
++ * Compiled in always; enabled at runtime with the skb_reuse module parameter.
++ * The reuse path resets all per-packet state before a buffer goes back to
++ * the hardware pool, so it is safe with netfilter.
++ */
+ #define REUSE_SKBUFFS_WITHOUT_FREE	1
+-#endif
+ 
+ #define USE_ASYNC_IOBDMA		(CONFIG_CAVIUM_OCTEON_CVMSEG_SIZE > 0)
+ 
+diff -Nurp a/drivers/staging/octeon/ethernet-tx.c b/drivers/staging/octeon/ethernet-tx.c
+--- a/drivers/staging/octeon/ethernet-tx.c	2026-11-11 15:23:19.339870926 +1100
++++ b/drivers/staging/octeon/ethernet-tx.c	2026-11-11 15:20:26.854922428 +1100
+@@ -27,6 +27,34 @@
+ #include "ethernet-tx.h"
+ #include "ethernet-util.h"
+ 
++static bool skb_reuse;
++module_param(skb_reuse, bool, 0644);
++MODULE_PARM_DESC(skb_reuse, "Return transmitted skbs straight to the hardware RX pool");
++static unsigned long skb_reused;
++module_param(skb_reused, ulong, 0444);
++
++/*
++ * Make an skb that goes back to the FPA pool look freshly allocated, the
++ * way the core's NAPI skb cache does, so no state from the transmitted
++ * packet (mark, priority, cb, GSO info, ...) leaks into the next receive.
++ */
++static void cvm_oct_skb_reinit(struct sk_buff *skb)
++{
++	struct skb_shared_info *shinfo = skb_shinfo(skb);
++	u8 head_frag = skb->head_frag;
++	u8 pfmemalloc = skb->pfmemalloc;
++	u8 pp_recycle = skb->pp_recycle;
++
++	memset(skb, 0, offsetof(struct sk_buff, tail));
++	skb->head_frag = head_frag;
++	skb->pfmemalloc = pfmemalloc;
++	skb->pp_recycle = pp_recycle;
++	skb->mac_header = (typeof(skb->mac_header))~0U;
++	skb->transport_header = (typeof(skb->transport_header))~0U;
++	skb->alloc_cpu = raw_smp_processor_id();
++	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
++}
++
+ #define CVM_OCT_SKB_CB(skb)	((u64 *)((skb)->cb))
+ 
+ /*
+@@ -294,6 +322,8 @@ netdev_tx_t cvm_oct_xmit(struct sk_buff
+ 	 * shown a 25% increase in performance under some loads.
+ 	 */
+ #if REUSE_SKBUFFS_WITHOUT_FREE
++	if (!READ_ONCE(skb_reuse))
++		goto dont_put_skbuff_in_hw;
+ 	fpa_head = skb->head + 256 - ((unsigned long)skb->head & 0x7f);
+ 	if (unlikely(skb->data < fpa_head)) {
+ 		/* TX buffer beginning can't meet FPA alignment constraints */
+@@ -324,9 +354,7 @@ netdev_tx_t cvm_oct_xmit(struct sk_buff
+ 		/* TX buffer has fragments */
+ 		goto dont_put_skbuff_in_hw;
+ 	}
+-	if (unlikely
+-	    (skb->truesize !=
+-	     sizeof(*skb) + skb_end_offset(skb))) {
++	if (unlikely(skb->truesize != SKB_TRUESIZE(skb_end_offset(skb)))) {
+ 		/* TX buffer truesize has been changed */
+ 		goto dont_put_skbuff_in_hw;
+ 	}
+@@ -404,6 +432,18 @@ dont_put_skbuff_in_hw:
+ 		cvmx_fau_async_fetch_and_add32(CVMX_SCR_SCRATCH,
+ 					       FAU_TOTAL_TX_TO_CLEAN, 1);
+ 
++#if REUSE_SKBUFFS_WITHOUT_FREE
++	/*
++	 * The hardware will free this buffer into the RX pool once sent:
++	 * reset the skb now, before the packet is handed to the PKO, so the
++	 * RX path can never see stale state.
++	 */
++	if (!pko_command.s.dontfree) {
++		cvm_oct_skb_reinit(skb);
++		skb_reused++;
++	}
++#endif
++
+ 	spin_lock_irqsave(&priv->tx_free_list[qos].lock, flags);
+ 
+ 	/* Drop this packet if we have too many already queued to the HW */

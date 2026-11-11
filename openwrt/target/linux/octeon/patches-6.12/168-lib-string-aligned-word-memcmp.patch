@@ -1,0 +1,43 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] lib/string: word-at-a-time memcmp for aligned buffers
+
+The generic memcmp() only compares a word at a time on architectures with
+CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS; everyone else (e.g. MIPS) gets a
+byte loop. Profiling NAT forwarding on an Octeon (flowtable offload) shows
+~6% of CPU time in memcmp(), from the rhashtable key compare of aligned
+flow tuples. Use a word loop when both pointers are word aligned; the
+byte loop still resolves the first differing word, so results are
+unchanged.
+
+diff -Nurp a/lib/string.c b/lib/string.c
+--- a/lib/string.c	2026-11-11 15:20:35.613129217 +1100
++++ b/lib/string.c	2026-11-11 15:20:35.632835300 +1100
+@@ -678,6 +678,28 @@ __visible int memcmp(const void *cs, con
+ 		cs = u1;
+ 		ct = u2;
+ 	}
++#else
++	/*
++	 * Without fast unaligned access, still compare a word at a time when
++	 * both buffers are word aligned (struct keys, e.g. the flowtable and
++	 * rhashtable lookups). The byte loop below resolves the first
++	 * differing word, so the result is unchanged.
++	 */
++	if (count >= sizeof(unsigned long) &&
++	    IS_ALIGNED((unsigned long)cs | (unsigned long)ct,
++		       sizeof(unsigned long))) {
++		const unsigned long *u1 = cs;
++		const unsigned long *u2 = ct;
++		do {
++			if (*u1 != *u2)
++				break;
++			u1++;
++			u2++;
++			count -= sizeof(unsigned long);
++		} while (count >= sizeof(unsigned long));
++		cs = u1;
++		ct = u2;
++	}
+ #endif
+ 	for (su1 = cs, su2 = ct; 0 < count; ++su1, ++su2, count--)
+ 		if ((res = *su1 - *su2) != 0)

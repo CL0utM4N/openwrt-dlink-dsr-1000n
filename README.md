@@ -60,10 +60,15 @@ official servers work.
 | `patches-6.12/163-staging-octeon-accept-length-errors.patch` | Don't drop frames for PIP length errors (Broadcom DSA tags trigger them) |
 | `patches-6.12/164-dts-dlink-dsr-1000n-buttons.patch` | Reset and WPS buttons (gpio-keys-polled) |
 | `patches-6.12/165-crypto-octeon-add-aes.patch` | **New driver:** AES-128/192/256 (block cipher, ECB, CBC) on the Octeon crypto coprocessor. Mainline only uses it for MD5/SHA. Checks FIPS-197 / SP 800-38A test vectors at load and refuses to register if they fail. Used automatically by IPsec, SMB3 encryption, dm-crypt; `modprobe octeon-aes bench=1` prints a benchmark |
-| `patches-6.12/166-staging-octeon-rx-fastpath.patch` | **Experimental, off by default:** Octeon RX fast path. Hands established flows straight from the driver's receive loop to the firewall's flowtable (needs software flow offloading on), skipping DSA's GRO pass, a second stack pass and the bridge. `echo 1 > /sys/module/octeon_ethernet/parameters/fastpath`; counters `fastpath_hits/misses/seen`. RAM-boot test: all transfers checksum-correct, ~+10% download / ~+40% upload through a test server on the router itself |
+| `patches-6.12/166-staging-octeon-rx-fastpath.patch` | Octeon RX fast path (on by default via `octeon-accel`). Hands established flows straight from the driver's receive loop to the firewall's flowtable (needs software flow offloading on), skipping DSA's GRO pass, a second stack pass and the bridge. `echo 1 > /sys/module/octeon_ethernet/parameters/fastpath`; counters `fastpath_hits/misses/seen`. RAM-boot test: all transfers checksum-correct, ~+10% download / ~+40% upload through a test server on the router itself |
+| `patches-6.12/167-staging-octeon-skb-reuse-switch.patch` | **Buffer reuse:** the PKO frees a transmitted buffer straight back into the hardware RX pool instead of an skb free + reallocation per packet. The driver's old code for this was compiled out with netfilter and its size check no longer matched current kernels; fixed, and the skb is reset to a freshly allocated state before reuse. Runtime switch `skb_reuse`, counter `skb_reused` |
+| `patches-6.12/168-lib-string-aligned-word-memcmp.patch` | Generic `memcmp()` compares a word at a time when both buffers are aligned (MIPS otherwise gets a byte loop); the flowtable's key compare was ~6% of CPU |
+| `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath` and `skb_reuse` at boot (both on); set to `0` and `/etc/init.d/octeon-accel reload` to turn off |
+| `files/etc/uci-defaults/92-dsr1000n-octeon-accel` | Enables the above and software flow offloading on first boot |
+| `files/etc/uci-defaults/91-dsr1000n-wifi-name` | The stock AR9160 card reports Atheros' reference ID 168c:2082, which OpenWrt's tables call "Ubiquiti SR71A" with a +7 dB TX power offset; corrects that entry to "Atheros AR9160", 0 dB, on this board |
 | `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon` package |
 | `image/Makefile` | `Device/dlink_dsr-1000n`: ELF kernel with appended DTB + squashfs, `sysupgrade.bin` |
-| `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core) |
+| `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core); `CVMSEG_SIZE=2`, no `LOCK_L2` (see Performance) |
 | `base-files/lib/preinit/01_sysinfo` | Board detection from the DT model (U-Boot reports board type 20006, which OpenWrt calls ITUS_SHIELD) |
 | `base-files/etc/board.d/01_network` | lan1-4 / wan, real MACs from product data |
 | `base-files/lib/upgrade/platform.sh` | sysupgrade writes the `firmware` MTD partition |
@@ -74,6 +79,23 @@ official servers work.
 (no SMP, no USB 3/SATA/MMC/SPI, etc.) suit the DSR-1000N only. Do not use this tree to
 build images for other Octeon devices. Upstreaming would need a separate subtarget, or
 only the patches (160 and 161 are generic fixes) and the DTS.
+
+## Performance
+
+Measured on hardware (single 500 MHz core), NAT between LAN hosts through the router
+(hairpin: every packet takes Octeon RX → flowtable → Octeon TX):
+
+| Configuration | TCP, both directions at once, data verified | 64-byte UDP |
+|---|---|---|
+| Software flow offloading only | ~265 Mb/s | ~29 kpps |
+| + driver fast path (patch 166) | ~430 Mb/s | ~38–48 kpps |
+| + buffer reuse (patch 167) | ~610 Mb/s | ~53 kpps |
+| + word `memcmp` (patch 168), `CVMSEG_SIZE=2`, no `LOCK_L2` — the default | **~575–705 Mb/s** | **~59 kpps** |
+
+The last row's three changes only pay off once buffer reuse has removed the per-packet
+allocation cost; measured with reuse off they made no difference. `CVMSEG_SIZE=2` enables the
+driver's asynchronous IOBDMA work requests; disabling `LOCK_L2` leaves the whole 128 KB L2
+cache to packet data.
 
 ## Build
 
@@ -161,10 +183,9 @@ Over the console, stop U-Boot, then either:
 * **Save & Apply is slow, not broken.** With one 500 MHz core, a service takes 10–20 s to
   reload after Save & Apply, and Wi-Fi changes (radio restart, network reload, reconnect,
   DHCP) can take 30 s or more. Wait before checking whether a change took effect.
-* LuCI names the Wi-Fi card "Ubiquiti SR71A": it reports the Atheros reference subsystem
-  ID (168c:2082), which OpenWrt's ID table lists under that name. Cosmetic.
-* Routing throughput is limited by the single 500 MHz core; enable software flow
-  offloading (Network → Firewall) for best results.
+* Routing throughput is limited by the single 500 MHz core. Software flow offloading
+  plus the driver fast path and buffer reuse (on by default, see [Performance](#performance))
+  give the numbers below; turning any of them off costs speed, not function.
 * The battery clock may hold D-Link's old time until NTP corrects it.
 
 ## Credits

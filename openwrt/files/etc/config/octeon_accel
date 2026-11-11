@@ -1,0 +1,4 @@
+
+config octeon_accel 'main'
+	option fastpath '1'
+	option skb_reuse '1'
