@@ -123,7 +123,9 @@ platform_do_upgrade() {
 
 	case "$board" in
 	dlink,dsr-1000n)
-		default_do_upgrade "$tar_file"
+		# mtdparts from U-Boot names the partition "firmware";
+		# default_do_upgrade would otherwise look for "image"
+		PART_NAME=firmware default_do_upgrade "$tar_file"
 		return 0
 		;;
 	esac

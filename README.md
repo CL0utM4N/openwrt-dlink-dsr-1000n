@@ -14,7 +14,8 @@ replaces it with a current Linux 6.12 kernel, nftables firewall, WPA3 and LuCI o
 
 | | Status |
 |---|---|
-| Boot from flash, sysupgrade from LuCI (settings kept) | ✅ |
+| Boot from flash | ✅ tested |
+| sysupgrade (LuCI or `sysupgrade`), settings kept | ✅ tested (needs the fix below in the *running* image) |
 | BCM53115 switch via DSA (`lan1`..`lan4`, `wan`), port isolation | ✅ tested |
 | WAN1: DHCP, routing, firewall | ✅ tested |
 | LAN, LuCI over HTTPS (TLS 1.3) | ✅ tested |
@@ -59,6 +60,7 @@ official servers work.
 | `patches-6.12/163-staging-octeon-accept-length-errors.patch` | Don't drop frames for PIP length errors (Broadcom DSA tags trigger them) |
 | `patches-6.12/164-dts-dlink-dsr-1000n-buttons.patch` | Reset and WPS buttons (gpio-keys-polled) |
 | `patches-6.12/165-crypto-octeon-add-aes.patch` | **New driver:** AES-128/192/256 (block cipher, ECB, CBC) on the Octeon crypto coprocessor. Mainline only uses it for MD5/SHA. Checks FIPS-197 / SP 800-38A test vectors at load and refuses to register if they fail. Used automatically by IPsec, SMB3 encryption, dm-crypt; `modprobe octeon-aes bench=1` prints a benchmark |
+| `patches-6.12/166-staging-octeon-rx-fastpath.patch` | **Experimental, off by default:** Octeon RX fast path. Hands established flows straight from the driver's receive loop to the firewall's flowtable (needs software flow offloading on), skipping DSA's GRO pass, a second stack pass and the bridge. `echo 1 > /sys/module/octeon_ethernet/parameters/fastpath`; counters `fastpath_hits/misses/seen`. RAM-boot test: all transfers checksum-correct, ~+10% download / ~+40% upload through a test server on the router itself |
 | `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon` package |
 | `image/Makefile` | `Device/dlink_dsr-1000n`: ELF kernel with appended DTB + squashfs, `sysupgrade.bin` |
 | `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core) |
@@ -146,6 +148,14 @@ Over the console, stop U-Boot, then either:
   (it loads the image to `0xaa00000` and runs `firm_flash`), then `setenv bootcmd bootFirmware`, `saveenv`.
 
 ## Known issues / to do
+
+* **Upgrading from a build before commit "fix sysupgrade" fails safely** with
+  `Could not open mtd device: image` (nothing is written; the router reboots unchanged).
+  Older images looked for a partition called `image` instead of `firmware`. Fix the running
+  system once, then upgrade as normal:
+  ```
+  sed -i 's/^\([[:space:]]*\)default_do_upgrade "\$tar_file"$/\1PART_NAME=firmware default_do_upgrade "$tar_file"/' /lib/upgrade/platform.sh
+  ```
 
 * WAN2 and Wi-Fi access-point mode not yet tested on hardware.
 * **Save & Apply is slow, not broken.** With one 500 MHz core, a service takes 10–20 s to

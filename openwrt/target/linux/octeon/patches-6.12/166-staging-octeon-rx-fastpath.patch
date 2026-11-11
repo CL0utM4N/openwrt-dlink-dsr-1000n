@@ -1,0 +1,153 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] staging: octeon: optional RX fast path into the flowtable
+
+Hand IPv4/IPv6 frames addressed to the router straight to the netfilter
+flowtable (software flow offloading) from the NAPI loop. On a DSA conduit
+this does dsa_switch_rcv()'s work inline and skips its gro_cells pass, the
+second __netif_receive_skb_core() and the bridge for offloaded flows.
+Only flows the firewall has already offloaded are shortcut; everything
+else is delivered as before.
+
+Off by default: echo 1 > /sys/module/octeon_ethernet/parameters/fastpath
+Counters: fastpath_hits, fastpath_misses in the same directory.
+
+diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ethernet-rx.c
+--- a/drivers/staging/octeon/ethernet-rx.c	2026-11-11 13:08:10.962316009 +1100
++++ b/drivers/staging/octeon/ethernet-rx.c	2026-11-11 13:08:10.981888716 +1100
+@@ -19,6 +19,10 @@
+ #include <linux/smp.h>
+ #include <linux/interrupt.h>
+ #include <net/dst.h>
++#include <linux/if_bridge.h>
++#include <linux/netfilter_netdev.h>
++#include <net/dsa.h>
++#include <net/dst_metadata.h>
+ #ifdef CONFIG_XFRM
+ #include <linux/xfrm.h>
+ #include <net/xfrm.h>
+@@ -176,6 +180,112 @@ static void copy_segments_to_skb(struct
+ 	}
+ }
+ 
++/*
++ * Receive fast path: hand IPv4/IPv6 frames that are addressed to the router
++ * straight to the netfilter flowtable (software flow offloading) from the
++ * NAPI loop. For DSA conduits this does the work of dsa_switch_rcv() inline
++ * and skips its gro_cells pass, the second trip through
++ * __netif_receive_skb_core() and the bridge. Flows are only shortcut once
++ * the firewall has put them in its flowtable, so policy is unchanged.
++ * Everything else is delivered exactly as before.
++ *
++ * Runtime switch: /sys/module/octeon_ethernet/parameters/fastpath
++ */
++static bool fastpath;
++module_param(fastpath, bool, 0644);
++MODULE_PARM_DESC(fastpath, "Hand established flows to the flowtable directly from the RX loop");
++
++static unsigned long fastpath_hits;
++module_param(fastpath_hits, ulong, 0444);
++static unsigned long fastpath_misses;
++module_param(fastpath_misses, ulong, 0444);
++static unsigned long fastpath_seen;
++module_param(fastpath_seen, ulong, 0444);
++
++/* Returns true if the skb was consumed (forwarded, delivered or freed). */
++static bool cvm_oct_fastpath_rx(struct sk_buff *skb)
++{
++	struct net_device *dev = skb->dev, *user = dev, *target;
++	struct sk_buff *nskb;
++	int ret;
++
++	if (netdev_uses_dsa(dev)) {
++		struct dsa_port *cpu_dp = dev->dsa_ptr;
++		__be16 etype;
++
++		if (skb->protocol != htons(ETH_P_XDSA) || !cpu_dp ||
++		    !cpu_dp->rcv || skb_metadata_dst(skb) ||
++		    skb_vlan_tag_present(skb) ||
++		    cpu_dp->tag_ops->proto != DSA_TAG_PROTO_BRCM ||
++		    !pskb_may_pull(skb, 4))
++			return false;
++		/*
++		 * Broadcom tag: skb->data points 2 bytes into the 4-byte tag,
++		 * the real EtherType follows it. Only untagged IPv4/IPv6 is
++		 * handled here, so DSA's software VLAN untagging
++		 * (untag_*_pvid) would be a no-op and can be skipped; VLAN
++		 * frames keep the normal path.
++		 */
++		etype = *(__be16 *)(skb->data + 2);
++		if (etype != htons(ETH_P_IP) && etype != htons(ETH_P_IPV6))
++			return false;
++
++		/* same steps as dsa_switch_rcv(), minus gro_cells */
++		nskb = cpu_dp->rcv(skb, dev);
++		if (!nskb) {
++			kfree_skb(skb);
++			return true;
++		}
++		skb = nskb;
++		skb_push(skb, ETH_HLEN);
++		skb->pkt_type = PACKET_HOST;
++		skb->protocol = eth_type_trans(skb, skb->dev);
++		user = skb->dev;
++		if (unlikely(!dsa_user_dev_check(user))) {
++			netif_rx(skb);
++			return true;
++		}
++		dev_sw_netstats_rx_add(user, skb->len + ETH_HLEN);
++	}
++
++	fastpath_seen++;
++	if (skb->protocol != htons(ETH_P_IP) &&
++	    skb->protocol != htons(ETH_P_IPV6))
++		goto slow;
++
++	target = user;
++	if (netif_is_bridge_port(user)) {
++		target = netdev_master_upper_dev_get_rcu(user);
++		if (!target || br_vlan_enabled(target))
++			goto slow;
++	}
++	/* only frames the router itself would route */
++	if (!ether_addr_equal(eth_hdr(skb)->h_dest, target->dev_addr))
++		goto slow;
++
++	skb->dev = target;
++	if (!nf_hook_ingress_active(skb)) {
++		skb->dev = user;
++		goto slow;
++	}
++	skb_reset_network_header(skb);
++	if (!skb_transport_header_was_set(skb))
++		skb_reset_transport_header(skb);
++	skb_reset_mac_len(skb);
++
++	ret = nf_hook_ingress(skb);
++	if (ret < 0) {
++		/* stolen (forwarded by the flowtable) or dropped */
++		fastpath_hits++;
++		return true;
++	}
++	skb->dev = user;
++	fastpath_misses++;
++slow:
++	netif_receive_skb(skb);
++	return true;
++}
++
+ static int cvm_oct_poll(struct oct_rx_group *rx_group, int budget)
+ {
+ 	const int	coreid = cvmx_get_core_num();
+@@ -346,7 +456,11 @@ static int cvm_oct_poll(struct oct_rx_gr
+ 					dev->stats.rx_packets++;
+ 					dev->stats.rx_bytes += skb->len;
+ 				}
+-				netif_receive_skb(skb);
++				rcu_read_lock();
++				if (!READ_ONCE(fastpath) ||
++				    !cvm_oct_fastpath_rx(skb))
++					netif_receive_skb(skb);
++				rcu_read_unlock();
+ 			} else {
+ 				/*
+ 				 * Drop any packet received for a device that
