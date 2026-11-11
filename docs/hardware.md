@@ -22,7 +22,7 @@ The Octeon has one RGMII interface with three ports (`eth0`..`eth2`).
 | Linux | Connects to | Front panel |
 |---|---|---|
 | `eth0` | BCM53115 switch, IMP port 8, fixed 1 Gb/s RGMII | LAN1..LAN4 = switch ports 0..3 (LAN1 = port 0, verified), WAN1 = switch port 4 |
-| `eth1` | BCM53115 switch port 5, fixed 1 Gb/s RGMII | D-Link's WAN path (port 4 <-> 5). **Unused** by this port; b53 disables port 5 |
+| `eth1` | BCM53115 switch port 5, fixed 1 Gb/s RGMII | D-Link's WAN path (port 4 <-> 5). This port: switch port `wanlink`, bridged with `wan` in the switch, WAN interface on `eth1` (patches 173/174) |
 | `eth2` (`wan2`) | Broadcom BCM5481 PHY (ID 0x0143bca2) at MDIO address 8 | WAN2/DMZ |
 
 * Switch: Broadcom **BCM53115** rev 8, managed over MDIO through its pseudo-PHY at

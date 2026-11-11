@@ -66,6 +66,9 @@ official servers work.
 | `patches-6.12/169-staging-octeon-cheaper-tx-bookkeeping.patch` | TX cleanup tasklet scheduled every 1024 packets as the code comment intends (the test was inverted), and no watchdog CSR write when the hardware frees the buffer |
 | `patches-6.12/171-staging-octeon-add-octeon-fwd.patch` | RX hook + `cvm_oct_xmit_fpa_buffer()` in the driver, and the `octeon-fwd` module (see Performance) |
 | `patches-6.12/172-netfilter-flowtable-export-inet-hook.patch` | Exports `nf_flow_offload_inet_hook` so octeon-fwd can find a port's flowtable |
+| `patches-6.12/173-dts-dlink-dsr-1000n-wanlink.patch` | Switch port 5 (wired to `eth1`) as user port `wanlink`, fixed 1 Gb/s RGMII |
+| `patches-6.12/174-net-dsa-b53-rgmii-on-531x5-port5.patch` | b53: BCM53115 port 5 in `enabled_ports` (it was left out, so the switch dropped frames to it) and RGMII advertised for it |
+| `files/etc/uci-defaults/93-dsr1000n-wan-eth1` | Moves WAN to `eth1` via `br-wan` (wan + wanlink) on first boot, keeps WAN1's MAC; undo steps in the file |
 | `package/kernel/linux/modules/netdevices.mk` | `kmod-octeon-fwd` package |
 | `package/network/config/firewall4/patches/100-software-offload-on-lower-devices.patch` | fw4 registers the software flowtable on bridge members (`lan1`..`lan4`) instead of `br-lan`, so offloaded flows transmit directly to the port (no bridge, no neighbour lookup) |
 | `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath`, `skb_reuse`, `conduit_noqueue` (no qdisc on `eth0`) and `wqe_fwd` (octeon-fwd) at boot, all on; set an option to `0` and `/etc/init.d/octeon-accel reload` to turn it off |
@@ -98,19 +101,39 @@ gigabit line rate (~80.7 kpps).
 | + driver fast path (166), buffer reuse (167), `memcmp` (168), `CVMSEG_SIZE=2`, no `LOCK_L2` | ~66 kpps (~795 Mb/s) | ~67 kpps |
 | + no qdisc on the DSA conduit `eth0` (was `fq_codel`) | ~77 kpps (~925 Mb/s) | — |
 | + flowtable on the switch ports (fw4 patch) | 80.7 kpps, zero loss: line rate (~970 Mb/s) | ~115–120 kpps |
-| + **octeon-fwd** (171/172): forwarding from the RX hardware buffer, the default | **80.7 kpps, line rate** | **~255–265 kpps** |
+| + octeon-fwd (171/172): forwarding from the RX hardware buffer | 80.7 kpps, line rate | ~255–265 kpps |
+| + octeon-fwd v5 (cached device lookups, one combined NAT checksum update, no per-packet divide), the default | **80.7 kpps, line rate** | **~317 kpps forwarded (load limit of the test PC), ~350 kpps estimated ceiling** |
 
-TCP through NAT (multiple streams): **~917 Mb/s**, 97.5% of the ~941 Mb/s TCP maximum on
-gigabit; single stream ~870 Mb/s; with data verification (64 MB each way) ~800–820 Mb/s.
-Latency added by the router: ~0.15 ms median idle.
+TCP through NAT (multiple streams): **~917–954 Mb/s** per direction, at the ~941–954 Mb/s TCP
+maximum on gigabit; single stream ~870 Mb/s; with data verification (64 MB each way)
+~800–820 Mb/s. Latency added by the router: ~0.15 ms median idle.
+
+### Second CPU link for WAN1
+
+The board wires switch port 5 to the Octeon's second RGMII port (`eth1`); D-Link's firmware used
+it as the WAN path. Patches 173/174 expose it as switch port `wanlink`, and
+`uci-defaults/93-dsr1000n-wan-eth1` bridges `wan` + `wanlink` inside the switch (`br-wan`, no
+IP) and moves the WAN interface to `eth1` (keeping WAN1's MAC). WAN1 traffic then has its own
+1 Gb/s link into the CPU, untagged, instead of sharing `eth0` with the LAN.
+
+Measured LAN PC ↔ router ↔ laptop on WAN1, 8 TCP streams each way (the laptop's single CPU core
+limits the combined test):
+
+| | Download only | Upload only | Both at once (total) |
+|---|---|---|---|
+| WAN1 sharing `eth0` with the LAN (before) | 943 Mb/s | 930 Mb/s | **942 Mb/s** (router CPU 99%) |
+| WAN1 on its own link, `eth1` (default) | 952 Mb/s | 952 Mb/s | **1,434 Mb/s** (router CPU 75%) |
+
+WAN2 (`eth2`) already has its own link; octeon-fwd covers it too.
 
 ### octeon-fwd
 
 `kmod-octeon-fwd` hooks the octeon-ethernet RX loop before the network stack. For packets from
-the Broadcom-tagged switch it looks the flow up in the **kernel's own flowtable** (the one fw4
-registers on the switch ports), applies the flowtable's NAT/TTL/MAC rewrite in place, writes the
-Broadcom egress tag and hands the same FPA buffer to the PKO, which frees it back into the RX
-pool. No skb processing, network stack, DSA, bridge or qdisc per packet. Policy, flow setup,
+the Broadcom-tagged switch or a plain Octeon port (`eth1`, `wan2`) it looks the flow up in the
+**kernel's own flowtable** (the one fw4 registers on the ports), applies the flowtable's
+NAT/TTL/MAC rewrite in place, adds, keeps or removes the Broadcom tag for the output port (MAC from
+the flow for bridge/DSA paths, from the confirmed neighbour entry for routed ones) and hands the
+same FPA buffer to the PKO, which frees it back into the RX pool. No skb processing, network stack, DSA, bridge or qdisc per packet. Policy, flow setup,
 timeouts and counters stay netfilter's; anything not matched (new connections, non-IPv4, IP
 options, fragments, TCP FIN/RST, MTU, non-direct paths, Wi-Fi) takes the normal path unchanged.
 Counters: `/sys/module/octeon_fwd/parameters/{hits,misses,passed}`; off switch `enable`, or

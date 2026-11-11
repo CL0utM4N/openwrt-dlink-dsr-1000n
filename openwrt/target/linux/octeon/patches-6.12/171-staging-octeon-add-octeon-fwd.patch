@@ -12,7 +12,6 @@ swaps in the Broadcom egress tag and submits the buffer straight to the PKO.
 No skb processing, network stack, DSA, bridge or qdisc layers per packet.
 Flow state, policy, timeouts and counters stay the kernel flowtable's;
 anything not matched takes the normal receive path unchanged.
-
 diff -Nurp a/drivers/staging/octeon/Kconfig b/drivers/staging/octeon/Kconfig
 --- a/drivers/staging/octeon/Kconfig	2026-11-11 20:37:17.551024570 +1100
 +++ b/drivers/staging/octeon/Kconfig	2026-11-11 20:37:17.587252078 +1100
@@ -158,12 +157,13 @@ diff -Nurp a/drivers/staging/octeon/octeon-ethernet.h b/drivers/staging/octeon/o
  int cvm_oct_sgmii_init(struct net_device *dev);
 diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon-fwd.c
 --- a/drivers/staging/octeon/octeon-fwd.c	1970-01-01 10:00:00.000000000 +1000
-+++ b/drivers/staging/octeon/octeon-fwd.c	2026-11-11 20:37:17.598243317 +1100
-@@ -0,0 +1,270 @@
++++ b/drivers/staging/octeon/octeon-fwd.c	2026-11-11 23:48:12.107164312 +1100
+@@ -0,0 +1,480 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * octeon-fwd: forward offloaded flows straight from the receive hardware
-+ * buffer, for Octeon ports behind a Broadcom-tagged DSA switch.
++ * buffer, for Octeon ports behind a Broadcom-tagged DSA switch and plain
++ * Octeon ports (e.g. eth1 behind switch port 5), in any combination.
 + *
 + * For every zero-copy packet the octeon-ethernet RX loop receives, this
 + * module looks the flow up in the netfilter flowtable registered on the
@@ -188,8 +188,11 @@ diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon
 +#include <linux/udp.h>
 +#include <linux/netfilter.h>
 +#include <linux/unaligned.h>
++#include <net/arp.h>
 +#include <net/dsa.h>
 +#include <net/ip.h>
++#include <net/neighbour.h>
++#include <net/route.h>
 +#include <net/checksum.h>
 +#include <net/netfilter/nf_flow_table.h>
 +#include <net/netfilter/nf_conntrack_acct.h>
@@ -215,17 +218,125 @@ diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon
 +#define BRCM_EG_PID_MASK	0x1f
 +#define BRCM_IG_DSTMAP1_MASK	0xff
 +
-+static struct net_device *fwd_user_port(struct net_device *conduit, int port)
-+{
-+	struct dsa_port *cpu_dp = conduit->dsa_ptr, *dp;
++/*
++ * Per-packet device resolution is cached; any netdev change flushes the
++ * caches (netdevice notifier). Entries are plain pointers read under RCU:
++ * a device is only freed after unregistration, which flushes first.
++ */
++struct fwd_in_ent {
++	struct net_device *dev;		/* switch user port */
++	struct net_device *upper;	/* its bridge, or the port itself */
++};
++static struct fwd_in_ent fwd_in_cache[32];
 +
++struct fwd_out_ent {
++	int ifindex;
++	struct net_device *dev;		/* output netdev */
++	struct net_device *txdev;	/* Octeon port that transmits */
++	u8 tagged;			/* needs a Broadcom tag */
++	u8 port;			/* switch port, if tagged */
++};
++#define FWD_OUT_SLOTS 16
++static struct fwd_out_ent fwd_out_cache[FWD_OUT_SLOTS];
++static DEFINE_SPINLOCK(fwd_cache_lock);
++
++static void fwd_cache_flush(void)
++{
++	spin_lock_bh(&fwd_cache_lock);
++	memset(fwd_in_cache, 0, sizeof(fwd_in_cache));
++	memset(fwd_out_cache, 0, sizeof(fwd_out_cache));
++	spin_unlock_bh(&fwd_cache_lock);
++}
++
++static int fwd_netdev_event(struct notifier_block *nb, unsigned long event,
++			    void *ptr)
++{
++	switch (event) {
++	case NETDEV_REGISTER:
++	case NETDEV_UNREGISTER:
++	case NETDEV_UP:
++	case NETDEV_DOWN:
++	case NETDEV_CHANGE:
++	case NETDEV_CHANGENAME:
++	case NETDEV_CHANGEADDR:
++	case NETDEV_CHANGEUPPER:
++		fwd_cache_flush();
++		break;
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block fwd_netdev_nb = {
++	.notifier_call = fwd_netdev_event,
++};
++
++static const struct fwd_in_ent *fwd_in_port(struct net_device *conduit,
++					     int port)
++{
++	struct fwd_in_ent *e = &fwd_in_cache[port & 31];
++	struct dsa_port *cpu_dp = conduit->dsa_ptr, *dp;
++	struct net_device *in = NULL, *upper;
++
++	if (likely(READ_ONCE(e->dev)))
++		return e;
 +	if (unlikely(!cpu_dp))
 +		return NULL;
 +	list_for_each_entry(dp, &cpu_dp->dst->ports, list)
 +		if (dp->ds->index == 0 && dp->index == port &&
-+		    dp->type == DSA_PORT_TYPE_USER)
-+			return dp->user;
-+	return NULL;
++		    dp->type == DSA_PORT_TYPE_USER) {
++			in = dp->user;
++			break;
++		}
++	if (!in)
++		return NULL;
++	upper = in;
++	if (netif_is_bridge_port(in)) {
++		upper = netdev_master_upper_dev_get_rcu(in);
++		if (!upper)
++			return NULL;
++	}
++	spin_lock(&fwd_cache_lock);
++	e->upper = upper;
++	WRITE_ONCE(e->dev, in);
++	spin_unlock(&fwd_cache_lock);
++	return e;
++}
++
++/* Resolve how to transmit on @out; @rx is the receiving Octeon port. */
++static const struct fwd_out_ent *fwd_out_dev(struct net_device *rx,
++					     struct net_device *out)
++{
++	/* power-of-two mask: a signed % would be a hardware divide per packet */
++	struct fwd_out_ent *e =
++		&fwd_out_cache[(unsigned int)out->ifindex & (FWD_OUT_SLOTS - 1)];
++	struct net_device *txdev;
++	struct dsa_port *odp;
++	u8 tagged = 0, port = 0;
++
++	if (likely(READ_ONCE(e->dev) == out && e->ifindex == out->ifindex))
++		return e;
++	if (dsa_user_dev_check(out)) {
++		odp = dsa_port_from_netdev(out);
++		if (IS_ERR(odp) || odp->ds->index != 0 || odp->index > 7)
++			return NULL;
++		txdev = odp->cpu_dp->conduit;
++		tagged = 1;
++		port = odp->index;
++	} else {
++		txdev = out;
++	}
++	/* both ends must be Octeon ports driven by octeon-ethernet */
++	if (txdev->netdev_ops != rx->netdev_ops ||
++	    !!netdev_uses_dsa(txdev) != !!tagged)
++		return NULL;
++	spin_lock(&fwd_cache_lock);
++	e->ifindex = out->ifindex;
++	e->txdev = txdev;
++	e->tagged = tagged;
++	e->port = port;
++	WRITE_ONCE(e->dev, out);
++	spin_unlock(&fwd_cache_lock);
++	return e;
 +}
 +
 +static struct nf_flowtable *fwd_flowtable(const struct net_device *dev)
@@ -241,59 +352,75 @@ diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon
 +	return NULL;
 +}
 +
-+/* Same as nf_flow_snat_ip()/nf_flow_dnat_ip() in nf_flow_table_ip.c */
-+static void fwd_nat_l4(struct sk_buff *skb, struct iphdr *iph,
-+		       __be32 addr, __be32 new_addr)
++static inline __wsum fwd_csum_swap(__wsum sum, __be32 from, __be32 to)
 +{
-+	if (iph->protocol == IPPROTO_TCP) {
-+		struct tcphdr *tcph = (void *)(iph + 1);
-+
-+		inet_proto_csum_replace4(&tcph->check, skb, addr, new_addr, true);
-+	} else {
-+		struct udphdr *udph = (void *)(iph + 1);
-+
-+		if (udph->check) {
-+			inet_proto_csum_replace4(&udph->check, skb, addr,
-+						 new_addr, true);
-+			if (!udph->check)
-+				udph->check = CSUM_MANGLED_0;
-+		}
-+	}
++	return csum_add(csum_sub(sum, (__force __wsum)from), (__force __wsum)to);
 +}
 +
-+static void fwd_nat(const struct flow_offload *flow, struct sk_buff *skb,
-+		    struct iphdr *iph, enum flow_offload_tuple_dir dir)
++/*
++ * NAT for one packet, as nf_flow_snat_port/ip + nf_flow_dnat_port/ip do,
++ * but with all address and port changes folded into one incremental update
++ * of the IP and L4 checksums (RFC 1624). SNAT and DNAT touch disjoint fields
++ * (source vs destination), so the result is identical to applying them in
++ * sequence.
++ */
++static void fwd_nat(const struct flow_offload *flow, struct iphdr *iph,
++		    enum flow_offload_tuple_dir dir)
 +{
-+	__be32 addr, new_addr;
++	const struct flow_offload_tuple *o = &flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple;
++	const struct flow_offload_tuple *r = &flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple;
++	struct flow_ports *p = (void *)(iph + 1);
++	__be32 osa = iph->saddr, oda = iph->daddr, nsa = osa, nda = oda;
++	__be16 osp = p->source, odp = p->dest, nsp = osp, ndp = odp;
++	__sum16 *l4sum;
++	__wsum d;
 +
 +	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
-+		nf_flow_snat_port(flow, skb, sizeof(*iph), iph->protocol, dir);
 +		if (dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
-+			addr = iph->saddr;
-+			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple.dst_v4.s_addr;
-+			iph->saddr = new_addr;
++			nsa = r->dst_v4.s_addr;
++			nsp = r->dst_port;
 +		} else {
-+			addr = iph->daddr;
-+			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.src_v4.s_addr;
-+			iph->daddr = new_addr;
++			nda = o->src_v4.s_addr;
++			ndp = o->src_port;
 +		}
-+		csum_replace4(&iph->check, addr, new_addr);
-+		fwd_nat_l4(skb, iph, addr, new_addr);
 +	}
 +	if (test_bit(NF_FLOW_DNAT, &flow->flags)) {
-+		nf_flow_dnat_port(flow, skb, sizeof(*iph), iph->protocol, dir);
 +		if (dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
-+			addr = iph->daddr;
-+			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple.src_v4.s_addr;
-+			iph->daddr = new_addr;
++			nda = r->src_v4.s_addr;
++			ndp = r->src_port;
 +		} else {
-+			addr = iph->saddr;
-+			new_addr = flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.dst_v4.s_addr;
-+			iph->saddr = new_addr;
++			nsa = o->dst_v4.s_addr;
++			nsp = o->dst_port;
 +		}
-+		csum_replace4(&iph->check, addr, new_addr);
-+		fwd_nat_l4(skb, iph, addr, new_addr);
 +	}
++	if (nsa == osa && nda == oda && nsp == osp && ndp == odp)
++		return;
++
++	iph->saddr = nsa;
++	iph->daddr = nda;
++	p->source = nsp;
++	p->dest = ndp;
++
++	d = fwd_csum_swap(~csum_unfold(iph->check), osa, nsa);
++	d = fwd_csum_swap(d, oda, nda);
++	iph->check = csum_fold(d);
++
++	if (iph->protocol == IPPROTO_TCP) {
++		l4sum = &((struct tcphdr *)p)->check;
++	} else {
++		l4sum = &((struct udphdr *)p)->check;
++		if (!*l4sum)
++			return;		/* UDP without checksum */
++	}
++	d = fwd_csum_swap(~csum_unfold(*l4sum), osa, nsa);	/* pseudo header */
++	d = fwd_csum_swap(d, oda, nda);
++	d = fwd_csum_swap(d, (__force __be32)(__force u32)osp,
++			  (__force __be32)(__force u32)nsp);
++	d = fwd_csum_swap(d, (__force __be32)(__force u32)odp,
++			  (__force __be32)(__force u32)ndp);
++	*l4sum = csum_fold(d);
++	if (iph->protocol == IPPROTO_UDP && !*l4sum)
++		*l4sum = CSUM_MANGLED_0;
 +}
 +
 +static int fwd_rx(struct net_device *dev, struct cvmx_wqe *work,
@@ -302,45 +429,63 @@ diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon
 +	struct flow_offload_tuple tuple = {};
 +	struct flow_offload_tuple_rhash *th;
 +	enum flow_offload_tuple_dir dir;
-+	struct net_device *in, *upper, *out;
++	struct net_device *in, *upper, *out, *txdev;
 +	struct flow_offload *flow;
 +	struct nf_flowtable *ft;
 +	struct flow_ports *ports;
-+	struct dsa_port *odp;
-+	unsigned int len = skb->len, tot;
++	const struct fwd_in_ent *ie;
++	const struct fwd_out_ent *oe;
++	unsigned int len = skb->len, tot, l2, newlen;
++	bool in_tagged, out_tagged;
++	union cvmx_buf_ptr buf;
++	u64 base, addr;
 +	struct iphdr *iph;
-+	u8 *d = skb->data;
++	u8 *d = skb->data, *nd;
++	const u8 *dmac, *smac;
++	u8 nh_mac[ETH_ALEN];
 +
-+	if (!READ_ONCE(enable) || !netdev_uses_dsa(dev) ||
-+	    len < BRCM_ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr))
++	if (!READ_ONCE(enable))
 +		return CVM_OCT_RX_PASS;
 +
-+	/* Broadcom tag, switch -> CPU direction: opcode 0, then the EtherType */
-+	if (((d[12] >> BRCM_OPCODE_SHIFT) & BRCM_OPCODE_MASK) ||
-+	    (d[14] & BRCM_EG_RC_RSVD) ||
-+	    get_unaligned((__be16 *)(d + 16)) != htons(ETH_P_IP))
++	in_tagged = netdev_uses_dsa(dev);
++	l2 = in_tagged ? BRCM_ETH_HLEN : ETH_HLEN;
++	if (len < l2 + sizeof(struct iphdr) + sizeof(struct udphdr))
 +		goto pass;
 +
-+	iph = (struct iphdr *)(d + BRCM_ETH_HLEN);
++	if (in_tagged) {
++		/* Broadcom tag, switch -> CPU: opcode 0, then the EtherType */
++		if (((d[12] >> BRCM_OPCODE_SHIFT) & BRCM_OPCODE_MASK) ||
++		    (d[14] & BRCM_EG_RC_RSVD) ||
++		    get_unaligned((__be16 *)(d + 16)) != htons(ETH_P_IP))
++			goto pass;
++		ie = fwd_in_port(dev, d[15] & BRCM_EG_PID_MASK);
++		if (!ie)
++			goto pass;
++		in = ie->dev;
++		upper = ie->upper;
++	} else {
++		/* plain Octeon port, e.g. eth1 behind switch port 5 */
++		if (get_unaligned((__be16 *)(d + 12)) != htons(ETH_P_IP))
++			goto pass;
++		in = dev;
++		upper = dev;
++	}
++	if (!(in->flags & IFF_UP))
++		goto pass;
++
++	iph = (struct iphdr *)(d + l2);
 +	if (iph->version != 4 || iph->ihl != 5 || ip_is_fragment(iph) ||
 +	    iph->ttl <= 1 ||
 +	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
 +		goto pass;
 +	tot = ntohs(iph->tot_len);
-+	if (tot + BRCM_ETH_HLEN > len ||
++	if (tot + l2 > len ||
 +	    tot < sizeof(*iph) + (iph->protocol == IPPROTO_TCP ?
 +				  sizeof(struct tcphdr) : sizeof(struct udphdr)))
 +		goto pass;
 +
-+	in = fwd_user_port(dev, d[15] & BRCM_EG_PID_MASK);
-+	if (!in || !(in->flags & IFF_UP))
++	if (upper != in && br_vlan_enabled(upper))
 +		goto pass;
-+	upper = in;
-+	if (netif_is_bridge_port(in)) {
-+		upper = netdev_master_upper_dev_get_rcu(in);
-+		if (!upper || br_vlan_enabled(upper))
-+			goto pass;
-+	}
 +	/* only frames addressed to the router are routed */
 +	if (!ether_addr_equal(d, upper->dev_addr))
 +		goto pass;
@@ -367,8 +512,7 @@ diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon
 +	flow = container_of(th, struct flow_offload, tuplehash[dir]);
 +
 +	/* same conditions as nf_flow_offload_forward(); else let it decide */
-+	if (th->tuple.xmit_type != FLOW_OFFLOAD_XMIT_DIRECT ||
-+	    th->tuple.encap_num || tot > th->tuple.mtu)
++	if (th->tuple.encap_num || tot > th->tuple.mtu)
 +		goto pass;
 +	if (iph->protocol == IPPROTO_TCP) {
 +		struct tcphdr *tcph = (void *)(iph + 1);
@@ -377,36 +521,96 @@ diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon
 +			goto pass;	/* normal path tears the flow down */
 +	}
 +
-+	out = dev_get_by_index_rcu(dev_net(in), th->tuple.out.ifidx);
-+	if (!out || !(out->flags & IFF_UP) || !dsa_user_dev_check(out))
++	if (th->tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT) {
++		/* bridge/DSA paths: MACs resolved when the flow was offloaded */
++		const struct fwd_out_ent *hint =
++			&fwd_out_cache[(unsigned int)th->tuple.out.ifidx &
++				       (FWD_OUT_SLOTS - 1)];
++
++		out = READ_ONCE(hint->dev);
++		if (!out || hint->ifindex != th->tuple.out.ifidx)
++			out = dev_get_by_index_rcu(dev_net(in),
++						   th->tuple.out.ifidx);
++		dmac = th->tuple.out.h_dest;
++		smac = th->tuple.out.h_source;
++	} else if (th->tuple.xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
++		/*
++		 * Plain ports (eth1, eth2): next hop from the cached route,
++		 * MAC from the neighbour table. Only confirmed entries are
++		 * used; anything else takes the normal path, which also
++		 * keeps the neighbour state machine (probes) running.
++		 */
++		struct rtable *rt = dst_rtable(th->tuple.dst_cache);
++		struct neighbour *n;
++		__be32 nexthop;
++
++		if (!dst_check(&rt->dst, th->tuple.dst_cookie))
++			goto pass;
++		out = rt->dst.dev;
++		if (!out || dsa_user_dev_check(out))
++			goto pass;
++		nexthop = rt_nexthop(rt, flow->tuplehash[!dir].tuple.src_v4.s_addr);
++		n = __ipv4_neigh_lookup_noref(out, (__force u32)nexthop);
++		if (!n || !(READ_ONCE(n->nud_state) &
++			    (NUD_REACHABLE | NUD_PERMANENT | NUD_NOARP)))
++			goto pass;
++		neigh_ha_snapshot(nh_mac, n, out);
++		dmac = nh_mac;
++		smac = out->dev_addr;
++	} else {
 +		goto pass;
-+	odp = dsa_port_from_netdev(out);
-+	if (IS_ERR(odp) || odp->cpu_dp->conduit != dev || odp->ds->index != 0 ||
-+	    odp->index > 7)
++	}
++	if (!out || !(out->flags & IFF_UP))
 +		goto pass;
++	oe = fwd_out_dev(dev, out);
++	if (!oe)
++		goto pass;
++	txdev = oe->txdev;
++	out_tagged = oe->tagged;
++
++	/* new frame start: drop or insert the 4-byte tag in front of the type */
++	nd = d;
++	newlen = len;
++	if (in_tagged && !out_tagged) {
++		nd = d + BRCM_TAG_LEN;
++		newlen = len - BRCM_TAG_LEN;
++	} else if (!in_tagged && out_tagged) {
++		nd = d - BRCM_TAG_LEN;
++		newlen = len + BRCM_TAG_LEN;
++	}
++	buf = work->packet_ptr;
++	base = ((buf.s.addr >> 7) - buf.s.back) << 7;	/* FPA buffer start */
++	addr = buf.s.addr + (nd - d);
++	if (addr < base || newlen < ETH_ZLEN)
++		goto pass;
++	buf.s.addr = addr;
++	buf.s.back = (addr >> 7) - (base >> 7);
 +
 +	/* commit: from here on the packet is forwarded or dropped */
 +	flow_offload_refresh(ft, flow, false);
 +
-+	skb_set_network_header(skb, BRCM_ETH_HLEN);
-+	skb->ip_summed = CHECKSUM_NONE;
-+	fwd_nat(flow, skb, iph, dir);
++	fwd_nat(flow, iph, dir);
 +	ip_decrease_ttl(iph);
 +	if (ft->flags & NF_FLOWTABLE_COUNTER)
 +		nf_ct_acct_update(flow->ct, dir, tot);
 +
-+	memcpy(d, th->tuple.out.h_dest, ETH_ALEN);
-+	memcpy(d + ETH_ALEN, th->tuple.out.h_source, ETH_ALEN);
-+	/* Broadcom tag, CPU -> switch: forward to exactly this port */
-+	d[12] = 1 << BRCM_OPCODE_SHIFT;
-+	d[13] = 0;
-+	d[14] = 0;
-+	d[15] = BIT(odp->index) & BRCM_IG_DSTMAP1_MASK;
++	/* EtherType is already in place for every layout */
++	memcpy(nd, dmac, ETH_ALEN);
++	memcpy(nd + ETH_ALEN, smac, ETH_ALEN);
++	if (out_tagged) {
++		/* Broadcom tag, CPU -> switch: forward to exactly this port */
++		nd[12] = 1 << BRCM_OPCODE_SHIFT;
++		nd[13] = 0;
++		nd[14] = 0;
++		nd[15] = BIT(oe->port) & BRCM_IG_DSTMAP1_MASK;
++	}
 +
-+	dev_sw_netstats_rx_add(in, len - BRCM_TAG_LEN);
-+	dev_sw_netstats_tx_add(out, 1, len - BRCM_TAG_LEN);
++	if (in_tagged)
++		dev_sw_netstats_rx_add(in, len - BRCM_TAG_LEN);
++	if (out_tagged)
++		dev_sw_netstats_tx_add(out, 1, newlen - BRCM_TAG_LEN);
 +
-+	if (unlikely(cvm_oct_xmit_fpa_buffer(dev, work->packet_ptr, len)))
++	if (unlikely(cvm_oct_xmit_fpa_buffer(txdev, buf, newlen)))
 +		return CVM_OCT_RX_DROP;
 +	hits++;
 +	return CVM_OCT_RX_SENT;
@@ -417,12 +621,17 @@ diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon
 +
 +static int __init octeon_fwd_init(void)
 +{
++	int err = register_netdevice_notifier(&fwd_netdev_nb);
++
++	if (err)
++		return err;
 +	return cvm_oct_set_rx_hook(fwd_rx);
 +}
 +
 +static void __exit octeon_fwd_exit(void)
 +{
 +	cvm_oct_set_rx_hook(NULL);
++	unregister_netdevice_notifier(&fwd_netdev_nb);
 +}
 +
 +module_init(octeon_fwd_init);

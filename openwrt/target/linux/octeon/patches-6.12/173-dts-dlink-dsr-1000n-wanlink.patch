@@ -1,0 +1,35 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] dts: dlink-dsr-1000n: switch port 5 <-> eth1 as "wanlink"
+
+Switch port 5 is wired to the Octeon's second RGMII port (eth1); D-Link's
+firmware used it as the WAN path (port-based VLAN WAN1 + port 5). Describe
+it as a user port with the same fixed RGMII link as the CPU port, so it can
+be bridged with "wan" in the switch and WAN traffic gets its own untagged
+link into the CPU.
+
+diff -Nurp a/arch/mips/boot/dts/cavium-octeon/dlink_dsr-1000n.dts b/arch/mips/boot/dts/cavium-octeon/dlink_dsr-1000n.dts
+--- a/arch/mips/boot/dts/cavium-octeon/dlink_dsr-1000n.dts	2026-11-11 22:00:03.248122961 +1100
++++ b/arch/mips/boot/dts/cavium-octeon/dlink_dsr-1000n.dts	2026-11-11 22:00:03.290143639 +1100
+@@ -94,6 +94,22 @@
+ 				reg = <4>;
+ 				label = "wan";
+ 			};
++			/*
++			 * Port 5 is wired to the Octeon's second RGMII port (eth1),
++			 * which D-Link used as the WAN path. As a user port it can be
++			 * bridged with "wan" in the switch, giving WAN traffic its
++			 * own untagged link into the CPU.
++			 */
++			port@5 {
++				reg = <5>;
++				label = "wanlink";
++				phy-mode = "rgmii-id";
++
++				fixed-link {
++					speed = <1000>;
++					full-duplex;
++				};
++			};
+ 			port@8 {
+ 				reg = <8>;
+ 				ethernet = <&{/soc@0/pip@11800a0000000/interface@0/ethernet@0}>;

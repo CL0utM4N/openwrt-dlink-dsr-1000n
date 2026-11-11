@@ -1,0 +1,40 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] net: dsa: b53: enable BCM53115 port 5, advertise its RGMII
+
+The BCM53115 has an RGMII-capable port 5 besides the IMP port, but its
+chip table entry leaves it out of enabled_ports (0x11f), so every
+per-port setup (default VLAN membership, bridge masks, jumbo) skips it:
+a user port on port 5 links up but the switch drops frames forwarded to
+it. Add port 5 (0x13f); an unused port 5 is still disabled as before.
+
+b53_phylink_mac_config() programs RGMII delays for BCM531x5 ports, but
+b53_phylink_get_caps() only advertised RGMII for BCM63xx, so phylink
+rejected an RGMII user port on port 5. Advertise it for port 5 and IMP.
+
+diff -Nurp a/drivers/net/dsa/b53/b53_common.c b/drivers/net/dsa/b53/b53_common.c
+--- a/drivers/net/dsa/b53/b53_common.c	2026-11-11 22:00:03.261420641 +1100
++++ b/drivers/net/dsa/b53/b53_common.c	2026-11-11 22:47:34.753848724 +1100
+@@ -1539,6 +1539,13 @@ static void b53_phylink_get_caps(struct
+ 	if (is63xx(dev) && in_range(port, B53_63XX_RGMII0, 4))
+ 		phy_interface_set_rgmii(config->supported_interfaces);
+ 
++	/*
++	 * BCM531x5 port 5 and the IMP port are RGMII capable;
++	 * b53_phylink_mac_config() already programs their delays.
++	 */
++	if (is531x5(dev) && (port == 5 || port == dev->imp_port))
++		phy_interface_set_rgmii(config->supported_interfaces);
++
+ 	config->mac_capabilities = MAC_ASYM_PAUSE | MAC_SYM_PAUSE |
+ 		MAC_10 | MAC_100;
+ 
+@@ -2862,7 +2869,8 @@ static const struct b53_chip_data b53_sw
+ 		.chip_id = BCM53115_DEVICE_ID,
+ 		.dev_name = "BCM53115",
+ 		.vlans = 4096,
+-		.enabled_ports = 0x11f,
++		/* ports 0-4 (PHYs), 5 (GMII/RGMII) and 8 (IMP) */
++		.enabled_ports = 0x13f,
+ 		.arl_bins = 4,
+ 		.arl_buckets = 1024,
+ 		.vta_regs = B53_VTA_REGS,

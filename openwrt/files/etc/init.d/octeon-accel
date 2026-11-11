@@ -3,8 +3,9 @@
 #   fastpath        - hand offloaded flows to the flowtable straight from the RX
 #                     loop (needs Network -> Firewall -> Software flow offloading)
 #   skb_reuse       - return transmitted buffers directly to the hardware RX pool
-#   conduit_noqueue - no qdisc on the DSA conduit (eth0). Every port already has
-#                     its own device; put SQM/cake on the WAN port if wanted.
+#   conduit_noqueue - no qdisc on the Octeon ports (eth0 = DSA conduit, eth1,
+#                     eth2). Put SQM/cake on the WAN device if wanted; it
+#                     replaces this.
 #   wqe_fwd         - octeon-fwd: forward offloaded flows straight from the RX
 #                     hardware buffer (kmod-octeon-fwd)
 # All default to on. "/etc/init.d/octeon-accel reload" applies changes.
@@ -27,9 +28,13 @@ apply() {
 		echo "$wqe" > /sys/module/octeon_fwd/parameters/enable
 
 	command -v tc >/dev/null || return 0
-	for dev in /sys/class/net/*/dsa; do
-		[ -d "$dev" ] || continue
-		dev="${dev%/dsa}"; dev="${dev##*/}"
+	for dev in /sys/class/net/*; do
+		dev="${dev##*/}"
+		# every Octeon port: the DSA conduit (eth0), eth1, eth2/wan2
+		case "$(readlink /sys/class/net/$dev/device/driver 2>/dev/null)" in
+		*/octeon_ethernet) ;;
+		*) [ -d "/sys/class/net/$dev/dsa" ] || continue ;;
+		esac
 		if [ "$noqueue" = 1 ]; then
 			tc qdisc replace dev "$dev" root noqueue 2>/dev/null
 		else

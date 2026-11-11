@@ -1,0 +1,61 @@
+#!/bin/sh
+# D-Link DSR-1000N: give WAN1 its own link into the CPU, as D-Link's firmware did.
+#
+# Switch port 5 is wired to the Octeon's second RGMII port (eth1). With the
+# "wanlink" switch port (patches 173/174), WAN1 and port 5 are bridged inside
+# the switch (br-wan, hardware forwarded, no IP) and the WAN interface uses eth1:
+# WAN traffic no longer shares the LAN's link (eth0) and arrives untagged.
+#
+# Only converts the stock layout (WAN on the "wan" switch port). To go back:
+#   uci set network.wan.device=wan; uci set network.wan6.device=wan
+#   uci delete network.br_wan_dev; uci delete network.wanlink; uci commit network
+
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "dlink,dsr-1000n" ] || exit 0
+[ -d /sys/class/net/wanlink ] || exit 0		# kernel without the port 5 link
+[ -d /sys/class/net/eth1 ] || exit 0
+[ "$(uci -q get network.wan.device)" = "wan" ] || exit 0
+
+for i in wan wan6; do
+	[ "$(uci -q get network.$i.device)" = "wan" ] && uci set network.$i.device='eth1'
+done
+
+uci -q delete network.br_wan_dev
+uci set network.br_wan_dev=device
+uci set network.br_wan_dev.type='bridge'
+uci set network.br_wan_dev.name='br-wan'
+uci add_list network.br_wan_dev.ports='wan'
+uci add_list network.br_wan_dev.ports='wanlink'
+
+uci -q delete network.wanlink
+uci set network.wanlink=interface
+uci set network.wanlink.proto='none'
+uci set network.wanlink.device='br-wan'
+
+# Keep WAN1's MAC address (D-Link base MAC + 1) on the new WAN device, eth1.
+# The switch-side "wan" port and br-wan carry no IP; they get the locally
+# administered variant of it, so the switch never sees the router's own MAC
+# on its CPU port (that would steer WAN traffic for eth1 to the wrong link).
+. /lib/functions/system.sh
+. /usr/share/libubox/jshn.sh
+json_init
+json_load "$(cat /etc/board.json)"
+mac=
+if json_select network 2>/dev/null && json_select wan 2>/dev/null; then
+	json_get_var mac macaddr
+fi
+if [ -n "$mac" ]; then
+	dev_section() {
+		local s
+		s=$(uci show network | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='$1'$/\1/p" | head -1)
+		[ -n "$s" ] || s=$(uci add network device)
+		uci set network.$s.name="$1"
+		echo "$s"
+	}
+	la=$(macaddr_setbit_la "$mac")
+	uci set network.$(dev_section eth1).macaddr="$mac"
+	uci set network.$(dev_section wan).macaddr="$la"
+	uci set network.br_wan_dev.macaddr="$la"
+fi
+
+uci commit network
+exit 0
