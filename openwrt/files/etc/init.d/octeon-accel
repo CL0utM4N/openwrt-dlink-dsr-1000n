@@ -8,13 +8,15 @@
 #                     replaces this.
 #   wqe_fwd         - octeon-fwd: forward offloaded flows straight from the RX
 #                     hardware buffer (kmod-octeon-fwd)
-# All default to on. "/etc/init.d/octeon-accel reload" applies changes.
+#   des3            - hardware Triple DES (kmod-crypto-des3-octeon). 3DES is
+#                     obsolete; only for old VPN peers. Default off.
+# All but des3 default to on. "/etc/init.d/octeon-accel reload" applies changes.
 
 START=19
 
 apply() {
 	local p=/sys/module/octeon_ethernet/parameters
-	local fastpath skb_reuse noqueue wqe dev
+	local fastpath skb_reuse noqueue wqe des3 dev
 
 	[ -d "$p" ] || return 0
 	config_load octeon_accel
@@ -22,6 +24,12 @@ apply() {
 	config_get_bool skb_reuse main skb_reuse 1
 	config_get_bool noqueue main conduit_noqueue 1
 	config_get_bool wqe main wqe_fwd 1
+	config_get_bool des3 main des3 0
+	if [ "$des3" = 1 ]; then
+		modprobe octeon-des3 2>/dev/null
+	elif [ -d /sys/module/octeon_des3 ]; then
+		rmmod octeon_des3 2>/dev/null	# fails harmlessly while in use
+	fi
 	[ -w "$p/fastpath" ] && echo "$fastpath" > "$p/fastpath"
 	[ -w "$p/skb_reuse" ] && echo "$skb_reuse" > "$p/skb_reuse"
 	[ -w /sys/module/octeon_fwd/parameters/enable ] &&

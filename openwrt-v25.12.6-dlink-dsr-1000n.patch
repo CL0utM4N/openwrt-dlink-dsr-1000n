@@ -1,21 +1,22 @@
 diff --git a/files/etc/config/octeon_accel b/files/etc/config/octeon_accel
 new file mode 100755
-index 0000000..c651d37
+index 0000000..de12895
 --- /dev/null
 +++ b/files/etc/config/octeon_accel
-@@ -0,0 +1,6 @@
+@@ -0,0 +1,7 @@
 +
 +config octeon_accel 'main'
 +	option fastpath '1'
 +	option skb_reuse '1'
 +	option conduit_noqueue '1'
 +	option wqe_fwd '1'
++	option des3 '0'
 diff --git a/files/etc/init.d/octeon-accel b/files/etc/init.d/octeon-accel
 new file mode 100755
-index 0000000..69f50ed
+index 0000000..bf76d59
 --- /dev/null
 +++ b/files/etc/init.d/octeon-accel
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,56 @@
 +#!/bin/sh /etc/rc.common
 +# Octeon Ethernet forwarding accelerations, configured in /etc/config/octeon_accel:
 +#   fastpath        - hand offloaded flows to the flowtable straight from the RX
@@ -26,13 +27,15 @@ index 0000000..69f50ed
 +#                     replaces this.
 +#   wqe_fwd         - octeon-fwd: forward offloaded flows straight from the RX
 +#                     hardware buffer (kmod-octeon-fwd)
-+# All default to on. "/etc/init.d/octeon-accel reload" applies changes.
++#   des3            - hardware Triple DES (kmod-crypto-des3-octeon). 3DES is
++#                     obsolete; only for old VPN peers. Default off.
++# All but des3 default to on. "/etc/init.d/octeon-accel reload" applies changes.
 +
 +START=19
 +
 +apply() {
 +	local p=/sys/module/octeon_ethernet/parameters
-+	local fastpath skb_reuse noqueue wqe dev
++	local fastpath skb_reuse noqueue wqe des3 dev
 +
 +	[ -d "$p" ] || return 0
 +	config_load octeon_accel
@@ -40,6 +43,12 @@ index 0000000..69f50ed
 +	config_get_bool skb_reuse main skb_reuse 1
 +	config_get_bool noqueue main conduit_noqueue 1
 +	config_get_bool wqe main wqe_fwd 1
++	config_get_bool des3 main des3 0
++	if [ "$des3" = 1 ]; then
++		modprobe octeon-des3 2>/dev/null
++	elif [ -d /sys/module/octeon_des3 ]; then
++		rmmod octeon_des3 2>/dev/null	# fails harmlessly while in use
++	fi
 +	[ -w "$p/fastpath" ] && echo "$fastpath" > "$p/fastpath"
 +	[ -w "$p/skb_reuse" ] && echo "$skb_reuse" > "$p/skb_reuse"
 +	[ -w /sys/module/octeon_fwd/parameters/enable ] &&
@@ -331,17 +340,30 @@ index 0000000..f519f3c
 diff --git a/package/kernel/linux/modules/crypto.mk b/package/kernel/linux/modules/crypto.mk
 old mode 100644
 new mode 100755
-index 869601e..96293ef
+index 869601e..1d756bf
 --- a/package/kernel/linux/modules/crypto.mk
 +++ b/package/kernel/linux/modules/crypto.mk
-@@ -1206,3 +1206,21 @@ endef
+@@ -598,6 +598,12 @@ ifeq ($(CONFIG_CPU_MIPS32_R2),y)
+ 	  $(KernelPackage/crypto-lib-chacha20/mips32r2)
+ endif
+ 
++# 64-bit OCTEON: the same core, ported to the n64 ABI (patch 176)
++ifeq ($(CONFIG_TARGET_octeon),y)
++  KernelPackage/crypto-lib-chacha20/$(ARCH)=\
++	  $(KernelPackage/crypto-lib-chacha20/mips32r2)
++endif
++
+ ifdef KernelPackage/crypto-lib-chacha20/$(ARCH)
+   KernelPackage/crypto-lib-chacha20/$(CRYPTO_TARGET)=\
+ 	  $(KernelPackage/crypto-lib-chacha20/$(ARCH))
+@@ -1206,3 +1212,56 @@ endef
  
  $(eval $(call KernelPackage,crypto-xxhash))
  
 +
 +
 +define KernelPackage/crypto-aes-octeon
-+  TITLE:=AES cipher, ECB and CBC using the OCTEON crypto unit
++  TITLE:=AES cipher, ECB, CBC and CTR using the OCTEON crypto unit
 +  DEPENDS:=@TARGET_octeon +kmod-crypto-manager
 +  KCONFIG:=CONFIG_CRYPTO_AES_OCTEON
 +  FILES:=$(LINUX_DIR)/arch/mips/cavium-octeon/crypto/octeon-aes.ko
@@ -356,6 +378,41 @@ index 869601e..96293ef
 +endef
 +
 +$(eval $(call KernelPackage,crypto-aes-octeon))
++
++
++define KernelPackage/crypto-ghash-octeon
++  TITLE:=GHASH using the OCTEON crypto unit
++  DEPENDS:=@TARGET_octeon +kmod-crypto-ghash +kmod-crypto-hash
++  KCONFIG:=CONFIG_CRYPTO_GHASH_OCTEON
++  FILES:=$(LINUX_DIR)/arch/mips/cavium-octeon/crypto/octeon-ghash.ko
++  AUTOLOAD:=$(call AutoLoad,09,octeon-ghash)
++  $(call AddDepends/crypto)
++endef
++
++define KernelPackage/crypto-ghash-octeon/description
++  GCM GHASH using the OCTEON Galois-field multiplier; with
++  kmod-crypto-aes-octeon, AES-GCM runs entirely on the crypto unit.
++endef
++
++$(eval $(call KernelPackage,crypto-ghash-octeon))
++
++
++define KernelPackage/crypto-des3-octeon
++  TITLE:=Triple DES, ECB and CBC using the OCTEON crypto unit
++  DEPENDS:=@TARGET_octeon +kmod-crypto-des +kmod-crypto-manager
++  KCONFIG:=CONFIG_CRYPTO_DES3_OCTEON
++  FILES:=$(LINUX_DIR)/arch/mips/cavium-octeon/crypto/octeon-des3.ko
++  # not autoloaded: enable with "option des3 '1'" in /etc/config/octeon_accel
++  $(call AddDepends/crypto)
++endef
++
++define KernelPackage/crypto-des3-octeon/description
++  3DES-EDE block cipher plus ECB and CBC using the OCTEON crypto unit,
++  for old VPN peers. Loaded only when enabled in
++  /etc/config/octeon_accel (option des3 '1').
++endef
++
++$(eval $(call KernelPackage,crypto-des3-octeon))
 diff --git a/package/kernel/linux/modules/netdevices.mk b/package/kernel/linux/modules/netdevices.mk
 old mode 100644
 new mode 100755
@@ -528,10 +585,10 @@ index 62f97e8..1a48d1a 100755
 diff --git a/target/linux/octeon/config-6.12 b/target/linux/octeon/config-6.12
 old mode 100644
 new mode 100755
-index 563388d..5ba156d
+index 563388d..819e535
 --- a/target/linux/octeon/config-6.12
 +++ b/target/linux/octeon/config-6.12
-@@ -1,3 +1,61 @@
+@@ -1,3 +1,63 @@
 +# CONFIG_AT803X_PHY is not set
 +# CONFIG_ATA is not set
 +# CONFIG_BLK_DEV_THROTTLING is not set
@@ -543,6 +600,8 @@ index 563388d..5ba156d
 +# CONFIG_CRAMFS_BLOCKDEV is not set
 +# CONFIG_CRAMFS_MTD is not set
 +# CONFIG_CRYPTO_AES_OCTEON is not set
++# CONFIG_CRYPTO_DES3_OCTEON is not set
++# CONFIG_CRYPTO_GHASH_OCTEON is not set
 +# CONFIG_CRYPTO_MD5_OCTEON is not set
 +# CONFIG_CRYPTO_SHA1_OCTEON is not set
 +# CONFIG_CRYPTO_SHA256_OCTEON is not set
@@ -593,7 +652,7 @@ index 563388d..5ba156d
  CONFIG_64BIT=y
  CONFIG_AHCI_OCTEON=y
  CONFIG_ARCH_DMA_ADDR_T_64BIT=y
-@@ -9,26 +67,18 @@ CONFIG_ARCH_MMAP_RND_BITS_MIN=12
+@@ -9,26 +69,18 @@ CONFIG_ARCH_MMAP_RND_BITS_MIN=12
  CONFIG_ARCH_MMAP_RND_COMPAT_BITS_MAX=15
  CONFIG_ARCH_SPARSEMEM_ENABLE=y
  CONFIG_ARCH_SUSPEND_POSSIBLE=y
@@ -623,7 +682,7 @@ index 563388d..5ba156d
  CONFIG_COMPACT_UNEVICTABLE_DEFAULT=1
  CONFIG_COMPAT_32BIT_TIME=y
  CONFIG_CONTEXT_TRACKING=y
-@@ -50,7 +100,6 @@ CONFIG_CPU_SUPPORTS_64BIT_KERNEL=y
+@@ -50,7 +102,6 @@ CONFIG_CPU_SUPPORTS_64BIT_KERNEL=y
  CONFIG_CPU_SUPPORTS_HIGHMEM=y
  CONFIG_CPU_SUPPORTS_HUGEPAGES=y
  CONFIG_CPU_SUPPORTS_VZ=y
@@ -631,7 +690,7 @@ index 563388d..5ba156d
  CONFIG_CRC16=y
  CONFIG_CRYPTO_CRC32=y
  CONFIG_CRYPTO_CRC32C=y
-@@ -60,11 +109,6 @@ CONFIG_CRYPTO_LIB_GF128MUL=y
+@@ -60,11 +111,6 @@ CONFIG_CRYPTO_LIB_GF128MUL=y
  CONFIG_CRYPTO_LIB_POLY1305_RSIZE=2
  CONFIG_CRYPTO_LIB_SHA1=y
  CONFIG_CRYPTO_LIB_UTILS=y
@@ -643,7 +702,7 @@ index 563388d..5ba156d
  CONFIG_DEBUG_INFO_NONE=y
  CONFIG_DEPRECATED_IRQ_CPU_ONOFFLINE=y
  CONFIG_DMA_NEED_SYNC=y
-@@ -73,17 +117,14 @@ CONFIG_DTC=y
+@@ -73,17 +119,14 @@ CONFIG_DTC=y
  CONFIG_EARLY_PRINTK=y
  CONFIG_EDAC=y
  CONFIG_EDAC_ATOMIC_SCRUB=y
@@ -661,7 +720,7 @@ index 563388d..5ba156d
  CONFIG_FAT_FS=y
  CONFIG_FIXED_PHY=y
  CONFIG_FS_IOMAP=y
-@@ -147,27 +188,23 @@ CONFIG_MIPS_ELF_APPENDED_DTB=y
+@@ -147,27 +190,23 @@ CONFIG_MIPS_ELF_APPENDED_DTB=y
  CONFIG_MIPS_FP_SUPPORT=y
  CONFIG_MIPS_L1_CACHE_SHIFT=7
  CONFIG_MIPS_L1_CACHE_SHIFT_7=y
@@ -692,7 +751,7 @@ index 563388d..5ba156d
  CONFIG_NET_EGRESS=y
  CONFIG_NET_FLOW_LIMIT=y
  CONFIG_NET_INGRESS=y
-@@ -177,14 +214,10 @@ CONFIG_NLS=y
+@@ -177,14 +216,10 @@ CONFIG_NLS=y
  CONFIG_NLS_CODEPAGE_437=y
  CONFIG_NLS_ISO8859_1=y
  CONFIG_NO_GENERIC_PCI_IOPORT_MAP=y
@@ -707,7 +766,7 @@ index 563388d..5ba156d
  CONFIG_OCTEON_WDT=y
  CONFIG_OF=y
  CONFIG_OF_ADDRESS=y
-@@ -198,12 +231,7 @@ CONFIG_PADATA=y
+@@ -198,12 +233,7 @@ CONFIG_PADATA=y
  CONFIG_PAGE_POOL=y
  CONFIG_PAGE_SIZE_LESS_THAN_256KB=y
  CONFIG_PAGE_SIZE_LESS_THAN_64KB=y
@@ -720,7 +779,7 @@ index 563388d..5ba156d
  CONFIG_PCI_DOMAINS=y
  CONFIG_PCI_DRIVERS_LEGACY=y
  CONFIG_PERF_USE_VMALLOC=y
-@@ -213,33 +241,24 @@ CONFIG_PHYLIB_LEDS=y
+@@ -213,33 +243,24 @@ CONFIG_PHYLIB_LEDS=y
  CONFIG_PHYLINK=y
  CONFIG_PHYS_ADDR_T_64BIT=y
  CONFIG_PTP_1588_CLOCK_OPTIONAL=y
@@ -754,7 +813,7 @@ index 563388d..5ba156d
  CONFIG_SPLIT_PTE_PTLOCKS=y
  CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU=y
  CONFIG_SWIOTLB=y
-@@ -261,21 +280,15 @@ CONFIG_TREE_SRCU=y
+@@ -261,21 +282,15 @@ CONFIG_TREE_SRCU=y
  CONFIG_USB=y
  CONFIG_USB_COMMON=y
  CONFIG_USB_EHCI_BIG_ENDIAN_MMIO=y
@@ -779,7 +838,7 @@ index 563388d..5ba156d
 diff --git a/target/linux/octeon/image/Makefile b/target/linux/octeon/image/Makefile
 old mode 100644
 new mode 100755
-index 7b20247..8c16dc0
+index 7b20247..648efdc
 --- a/target/linux/octeon/image/Makefile
 +++ b/target/linux/octeon/image/Makefile
 @@ -120,4 +120,24 @@ define Device/cisco_vedge1000
@@ -793,7 +852,7 @@ index 7b20247..8c16dc0
 +  DEVICE_VARIANT := A1
 +  BOARD_NAME := dlink,dsr-1000n
 +  DEVICE_DTS := dlink_dsr-1000n
-+  DEVICE_PACKAGES += kmod-leds-gpio kmod-ath9k wpad-mbedtls kmod-dsa-b53-mdio kmod-rtc-ds1307 kmod-gpio-button-hotplug kmod-crypto-aes-octeon kmod-octeon-fwd \
++  DEVICE_PACKAGES += kmod-leds-gpio kmod-ath9k wpad-mbedtls kmod-dsa-b53-mdio kmod-rtc-ds1307 kmod-gpio-button-hotplug kmod-crypto-aes-octeon kmod-crypto-ghash-octeon kmod-crypto-des3-octeon kmod-crypto-sha1 kmod-octeon-fwd \
 +	-kmod-usb-dwc3-octeon -mkf2fs
 +  KERNEL := kernel-bin | strip-kernel | append-dtb-to-elf
 +  KERNEL_INITRAMFS := kernel-bin | strip-kernel | append-dtb-to-elf
@@ -987,42 +1046,45 @@ index 0000000..f749c05
 + 
 diff --git a/target/linux/octeon/patches-6.12/165-crypto-octeon-add-aes.patch b/target/linux/octeon/patches-6.12/165-crypto-octeon-add-aes.patch
 new file mode 100755
-index 0000000..677b05a
+index 0000000..e8b3704
 --- /dev/null
 +++ b/target/linux/octeon/patches-6.12/165-crypto-octeon-add-aes.patch
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,1293 @@
 +From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
-+Subject: [PATCH] crypto: octeon - add AES (cipher, ECB, CBC) using the crypto unit
++Subject: [PATCH] crypto: octeon - add AES (ECB, CBC, CTR), GHASH and 3DES
 +
 +Mainline only uses the OCTEON crypto coprocessor for MD5 and SHA-1/2.
-+Add AES (128/192/256) as a block cipher, so the generic ctr/gcm/ccm/xts
-+templates use the hardware, plus native ECB and CBC skciphers.
-+Known-answer tests (FIPS-197, SP 800-38A) run at load; the module refuses
-+to register if they fail.
-+
-+About 10x the throughput of aes-generic on a CN5010 (500 MHz).
++Add drivers for its AES unit (block cipher plus native ECB, CBC and CTR),
++its Galois-field multiplier (GHASH, so gcm(aes) runs entirely on the
++crypto unit with ctr-aes-octeon) and its 3DES unit (block cipher, ECB,
++CBC). Each module checks itself at load (FIPS-197 / SP 800-38A vectors
++for AES, cross-checks against aes-generic, ghash-generic and
++des3_ede-generic with random data and odd splits) and refuses to
++register on any mismatch.
 +
 +diff -Nurp a/arch/mips/cavium-octeon/crypto/Makefile b/arch/mips/cavium-octeon/crypto/Makefile
 +--- a/arch/mips/cavium-octeon/crypto/Makefile	2026-11-11 11:53:16.997021015 +1100
-++++ b/arch/mips/cavium-octeon/crypto/Makefile	2026-11-11 11:53:17.024875032 +1100
-+@@ -6,6 +6,7 @@
+++++ b/arch/mips/cavium-octeon/crypto/Makefile	2026-11-12 09:15:30.044365877 +1100
++@@ -6,6 +6,9 @@
 + obj-y += octeon-crypto.o
 + 
 + obj-$(CONFIG_CRYPTO_MD5_OCTEON)		+= octeon-md5.o
 ++obj-$(CONFIG_CRYPTO_AES_OCTEON)		+= octeon-aes.o
+++obj-$(CONFIG_CRYPTO_GHASH_OCTEON)	+= octeon-ghash.o
+++obj-$(CONFIG_CRYPTO_DES3_OCTEON)	+= octeon-des3.o
 + obj-$(CONFIG_CRYPTO_SHA1_OCTEON)	+= octeon-sha1.o
 + obj-$(CONFIG_CRYPTO_SHA256_OCTEON)	+= octeon-sha256.o
 + obj-$(CONFIG_CRYPTO_SHA512_OCTEON)	+= octeon-sha512.o
 +diff -Nurp a/arch/mips/cavium-octeon/crypto/octeon-aes.c b/arch/mips/cavium-octeon/crypto/octeon-aes.c
 +--- a/arch/mips/cavium-octeon/crypto/octeon-aes.c	1970-01-01 10:00:00.000000000 +1000
-++++ b/arch/mips/cavium-octeon/crypto/octeon-aes.c	2026-11-11 11:53:17.012997186 +1100
-+@@ -0,0 +1,458 @@
+++++ b/arch/mips/cavium-octeon/crypto/octeon-aes.c	2026-11-12 09:15:29.994044180 +1100
++@@ -0,0 +1,607 @@
 ++// SPDX-License-Identifier: GPL-2.0
 ++/*
 ++ * AES using the OCTEON crypto coprocessor (COP2).
 ++ *
-++ * Provides the "aes" block cipher (so the generic ctr/gcm/ccm/xts templates
-++ * use the hardware) plus native "ecb(aes)" and "cbc(aes)" skciphers.
+++ * Provides the "aes" block cipher (so the generic gcm/ccm/xts templates use
+++ * the hardware) plus native "ecb(aes)", "cbc(aes)" and "ctr(aes)" skciphers.
 ++ *
 ++ * COP2 register selectors as used by the Cavium OCTEON SDK (cvmx-asm.h):
 ++ *   0x0100-0x0101  AES result (read)
@@ -1043,6 +1105,7 @@ index 0000000..677b05a
 ++#include <linux/kernel.h>
 ++#include <linux/ktime.h>
 ++#include <linux/module.h>
+++#include <linux/random.h>
 ++#include <linux/slab.h>
 ++#include <linux/unaligned.h>
 ++#include <asm/octeon/octeon.h>
@@ -1147,6 +1210,46 @@ index 0000000..677b05a
 ++	put_unaligned_be64(b, iv + 8);
 ++}
 ++
+++/*
+++ * CTR: big-endian 128-bit counter in iv[], encrypted with the ECB path in one
+++ * COP2 session. Handles a trailing partial block (keystream truncated, counter
+++ * still advanced, as crypto/ctr.c does). Updates iv[].
+++ */
+++static void octeon_aes_ctr_bytes(const struct octeon_aes_ctx *ctx, u8 *dst,
+++				 const u8 *src, unsigned int nbytes, u8 *iv)
+++{
+++	u64 c0 = get_unaligned_be64(iv), c1 = get_unaligned_be64(iv + 8);
+++
+++	octeon_aes_load_key(ctx);
+++	while (nbytes) {
+++		unsigned int n = min_t(unsigned int, nbytes, AES_BLOCK_SIZE);
+++		u64 k0, k1;
+++
+++		OCT_MT(c0, 0x010a);
+++		OCT_MT(c1, 0x310b);
+++		k0 = OCT_MF(0x0100);
+++		k1 = OCT_MF(0x0101);
+++		if (++c1 == 0)
+++			c0++;
+++		if (n == AES_BLOCK_SIZE) {
+++			put_unaligned_be64(get_unaligned_be64(src) ^ k0, dst);
+++			put_unaligned_be64(get_unaligned_be64(src + 8) ^ k1, dst + 8);
+++		} else {
+++			u8 ks[AES_BLOCK_SIZE];
+++
+++			put_unaligned_be64(k0, ks);
+++			put_unaligned_be64(k1, ks + 8);
+++			crypto_xor_cpy(dst, src, ks, n);
+++			memzero_explicit(ks, sizeof(ks));
+++		}
+++		src += n;
+++		dst += n;
+++		nbytes -= n;
+++	}
+++	put_unaligned_be64(c0, iv);
+++	put_unaligned_be64(c1, iv + 8);
+++}
+++
 ++/* ---- "aes" single block cipher ---- */
 ++
 ++static int octeon_aes_cipher_setkey(struct crypto_tfm *tfm, const u8 *key,
@@ -1232,6 +1335,32 @@ index 0000000..677b05a
 ++	return err;
 ++}
 ++
+++static int octeon_aes_ctr_crypt(struct skcipher_request *req)
+++{
+++	struct octeon_aes_ctx *ctx =
+++		crypto_skcipher_ctx(crypto_skcipher_reqtfm(req));
+++	struct octeon_cop2_state state;
+++	struct skcipher_walk walk;
+++	unsigned long flags;
+++	unsigned int nbytes;
+++	int err;
+++
+++	err = skcipher_walk_virt(&walk, req, false);
+++	while ((nbytes = walk.nbytes)) {
+++		unsigned int n = nbytes;
+++
+++		/* only the very last step may end in a partial block */
+++		if (walk.nbytes < walk.total)
+++			n = round_down(nbytes, AES_BLOCK_SIZE);
+++		flags = octeon_crypto_enable(&state);
+++		octeon_aes_ctr_bytes(ctx, walk.dst.virt.addr,
+++				     walk.src.virt.addr, n, walk.iv);
+++		octeon_crypto_disable(&state, flags);
+++		err = skcipher_walk_done(&walk, nbytes - n);
+++	}
+++	return err;
+++}
+++
 ++static int octeon_aes_ecb_encrypt(struct skcipher_request *req)
 ++{
 ++	return octeon_aes_sk_crypt(req, false, true);
@@ -1278,6 +1407,20 @@ index 0000000..677b05a
 ++		.setkey			= octeon_aes_sk_setkey,
 ++		.encrypt		= octeon_aes_cbc_encrypt,
 ++		.decrypt		= octeon_aes_cbc_decrypt,
+++	}, {
+++		.base.cra_name		= "ctr(aes)",
+++		.base.cra_driver_name	= "ctr-aes-octeon",
+++		.base.cra_priority	= OCTEON_CR_OPCODE_PRIORITY,
+++		.base.cra_blocksize	= 1,
+++		.base.cra_ctxsize	= sizeof(struct octeon_aes_ctx),
+++		.base.cra_module	= THIS_MODULE,
+++		.min_keysize		= AES_MIN_KEY_SIZE,
+++		.max_keysize		= AES_MAX_KEY_SIZE,
+++		.ivsize			= AES_BLOCK_SIZE,
+++		.chunksize		= AES_BLOCK_SIZE,
+++		.setkey			= octeon_aes_sk_setkey,
+++		.encrypt		= octeon_aes_ctr_crypt,
+++		.decrypt		= octeon_aes_ctr_crypt,
 ++	},
 ++};
 ++
@@ -1376,6 +1519,71 @@ index 0000000..677b05a
 ++	return bad ? -EIO : 0;
 ++}
 ++
+++/*
+++ * CTR cross-check against aes-generic: random key, counter close to a 64-bit
+++ * carry, data split at odd offsets including partial blocks.
+++ */
+++static int octeon_aes_ctr_check(void)
+++{
+++	static const unsigned int lens[] = { 1, 15, 16, 17, 63, 200, 1000 };
+++	struct octeon_cop2_state state;
+++	struct crypto_cipher *gen;
+++	struct octeon_aes_ctx ctx;
+++	u8 key[32], iv0[16], iv[16], ctr[16], ks[16];
+++	unsigned long flags;
+++	u8 *src, *hw, *ref;
+++	int i, j, bad = 0, kl;
+++
+++	gen = crypto_alloc_cipher("aes-generic", 0, 0);
+++	if (IS_ERR(gen))
+++		return PTR_ERR(gen);
+++	src = kmalloc(3 * 1024, GFP_KERNEL);
+++	if (!src) {
+++		crypto_free_cipher(gen);
+++		return -ENOMEM;
+++	}
+++	hw = src + 1024;
+++	ref = hw + 1024;
+++	get_random_bytes(src, 1024);
+++
+++	for (kl = 16; kl <= 32 && !bad; kl += 8) {
+++		get_random_bytes(key, sizeof(key));
+++		get_random_bytes(iv0, sizeof(iv0));
+++		memset(iv0 + 8, 0xff, 7);	/* low 64 bits about to carry */
+++		octeon_aes_expand(&ctx, key, kl);
+++		crypto_cipher_setkey(gen, key, kl);
+++		for (i = 0; i < ARRAY_SIZE(lens) && !bad; i++) {
+++			unsigned int len = lens[i], half = len / 2 & ~15u;
+++
+++			/* reference: plain CTR with aes-generic */
+++			memcpy(ctr, iv0, 16);
+++			for (j = 0; j < len; j += 16) {
+++				crypto_cipher_encrypt_one(gen, ks, ctr);
+++				crypto_xor_cpy(ref + j, src + j, ks,
+++					       min_t(unsigned int, 16, len - j));
+++				crypto_inc(ctr, 16);
+++			}
+++			/* hardware, in two calls to check counter hand-over */
+++			memcpy(iv, iv0, 16);
+++			flags = octeon_crypto_enable(&state);
+++			octeon_aes_ctr_bytes(&ctx, hw, src, half, iv);
+++			octeon_aes_ctr_bytes(&ctx, hw + half, src + half,
+++					     len - half, iv);
+++			octeon_crypto_disable(&state, flags);
+++			if (memcmp(hw, ref, len) || memcmp(iv, ctr, 16)) {
+++				pr_err("octeon-aes: CTR check failed (AES-%d, %u bytes)\n",
+++				       kl * 8, len);
+++				bad = 1;
+++			}
+++		}
+++	}
+++	memzero_explicit(&ctx, sizeof(ctx));
+++	memzero_explicit(key, sizeof(key));
+++	kfree(src);
+++	crypto_free_cipher(gen);
+++	return bad ? -EIO : 0;
+++}
+++
 ++/* ---- optional benchmark: modprobe octeon-aes bench=1 ---- */
 ++
 ++static bool bench;
@@ -1442,9 +1650,11 @@ index 0000000..677b05a
 ++	if (!octeon_has_crypto())
 ++		return -ENOTSUPP;
 ++	err = octeon_aes_kat();
+++	if (!err)
+++		err = octeon_aes_ctr_check();
 ++	if (err)
 ++		return err;
-++	pr_info("octeon-aes: known-answer tests passed (AES-128/192/256, CBC)\n");
+++	pr_info("octeon-aes: self-tests passed (AES-128/192/256, CBC, CTR)\n");
 ++	if (bench)
 ++		octeon_aes_bench();
 ++
@@ -1469,27 +1679,664 @@ index 0000000..677b05a
 ++module_exit(octeon_aes_mod_exit);
 ++
 ++MODULE_LICENSE("GPL");
-++MODULE_DESCRIPTION("AES cipher, ECB and CBC using the OCTEON crypto coprocessor");
+++MODULE_DESCRIPTION("AES cipher, ECB, CBC and CTR using the OCTEON crypto coprocessor");
 ++MODULE_IMPORT_NS(CRYPTO_INTERNAL);
 ++MODULE_ALIAS_CRYPTO("aes");
 ++MODULE_ALIAS_CRYPTO("aes-octeon");
 ++MODULE_ALIAS_CRYPTO("ecb(aes)");
 ++MODULE_ALIAS_CRYPTO("cbc(aes)");
+++MODULE_ALIAS_CRYPTO("ctr(aes)");
++diff -Nurp a/arch/mips/cavium-octeon/crypto/octeon-des3.c b/arch/mips/cavium-octeon/crypto/octeon-des3.c
++--- a/arch/mips/cavium-octeon/crypto/octeon-des3.c	1970-01-01 10:00:00.000000000 +1000
+++++ b/arch/mips/cavium-octeon/crypto/octeon-des3.c	2026-11-12 09:15:30.037017870 +1100
++@@ -0,0 +1,364 @@
+++// SPDX-License-Identifier: GPL-2.0
+++/*
+++ * Triple DES (3DES-EDE) using the OCTEON crypto coprocessor (COP2): the
+++ * "des3_ede" block cipher plus native "ecb(des3_ede)" and "cbc(des3_ede)".
+++ * 3DES is obsolete; this is for interoperating with old VPN peers.
+++ *
+++ * COP2 register selectors as used by the Cavium OCTEON SDK (cvmx-asm.h):
+++ *   0x0080-0x0082  3DES keys K1..K3
+++ *   0x0084         3DES IV
+++ *   0x4088 / 0x408a  CBC / ECB encrypt (starts the operation)
+++ *   0x408c / 0x408e  CBC / ECB decrypt
+++ *   0x0088         3DES result (read)
+++ * In CBC mode the unit keeps the chaining value in the IV register itself.
+++ *
+++ * The module compares itself against des3_ede-generic at load and refuses to
+++ * register on mismatch.
+++ */
+++
+++#include <crypto/algapi.h>
+++#include <crypto/des.h>
+++#include <crypto/internal/cipher.h>
+++#include <crypto/internal/des.h>
+++#include <crypto/internal/skcipher.h>
+++#include <linux/kernel.h>
+++#include <linux/module.h>
+++#include <linux/random.h>
+++#include <linux/slab.h>
+++#include <linux/unaligned.h>
+++#include <asm/octeon/octeon.h>
+++
+++#include "octeon-crypto.h"
+++
+++#define OCT_MT(val, sel) \
+++	__asm__ __volatile__("dmtc2 %[rt]," #sel : : [rt] "d" ((u64)(val)))
+++#define OCT_MF(sel) ({ u64 __v; \
+++	__asm__ __volatile__("dmfc2 %[rt]," #sel : [rt] "=d" (__v)); __v; })
+++
+++struct octeon_des3_ctx {
+++	u64 key[3];
+++};
+++
+++static void octeon_des3_expand(struct octeon_des3_ctx *ctx, const u8 *key)
+++{
+++	ctx->key[0] = get_unaligned_be64(key);
+++	ctx->key[1] = get_unaligned_be64(key + 8);
+++	ctx->key[2] = get_unaligned_be64(key + 16);
+++}
+++
+++static inline void octeon_des3_load_key(const struct octeon_des3_ctx *ctx)
+++{
+++	OCT_MT(ctx->key[0], 0x0080);
+++	OCT_MT(ctx->key[1], 0x0081);
+++	OCT_MT(ctx->key[2], 0x0082);
+++}
+++
+++/* All helpers below must run between octeon_crypto_enable()/disable(). */
+++
+++static void octeon_des3_ecb_blocks(const struct octeon_des3_ctx *ctx, u8 *dst,
+++				   const u8 *src, unsigned int nblocks, bool enc)
+++{
+++	octeon_des3_load_key(ctx);
+++	while (nblocks--) {
+++		u64 v = get_unaligned_be64(src);
+++
+++		if (enc)
+++			OCT_MT(v, 0x408a);
+++		else
+++			OCT_MT(v, 0x408e);
+++		put_unaligned_be64(OCT_MF(0x0088), dst);
+++		src += DES3_EDE_BLOCK_SIZE;
+++		dst += DES3_EDE_BLOCK_SIZE;
+++	}
+++}
+++
+++/* Updates iv[] to the chaining value for the next call. */
+++static void octeon_des3_cbc_blocks(const struct octeon_des3_ctx *ctx, u8 *dst,
+++				   const u8 *src, unsigned int nblocks, u8 *iv,
+++				   bool enc)
+++{
+++	u64 last = 0;
+++
+++	octeon_des3_load_key(ctx);
+++	OCT_MT(get_unaligned_be64(iv), 0x0084);
+++	while (nblocks--) {
+++		u64 v = get_unaligned_be64(src), r;	/* src may equal dst */
+++
+++		if (enc)
+++			OCT_MT(v, 0x4088);
+++		else
+++			OCT_MT(v, 0x408c);
+++		r = OCT_MF(0x0088);
+++		put_unaligned_be64(r, dst);
+++		last = enc ? r : v;
+++		src += DES3_EDE_BLOCK_SIZE;
+++		dst += DES3_EDE_BLOCK_SIZE;
+++	}
+++	put_unaligned_be64(last, iv);
+++}
+++
+++/* ---- "des3_ede" single block cipher ---- */
+++
+++static int octeon_des3_cipher_setkey(struct crypto_tfm *tfm, const u8 *key,
+++				     unsigned int keylen)
+++{
+++	int err = crypto_des3_ede_verify_key(tfm, key);
+++
+++	if (err)
+++		return err;
+++	octeon_des3_expand(crypto_tfm_ctx(tfm), key);
+++	return 0;
+++}
+++
+++static void octeon_des3_cipher_crypt(struct crypto_tfm *tfm, u8 *dst,
+++				     const u8 *src, bool enc)
+++{
+++	struct octeon_cop2_state state;
+++	unsigned long flags;
+++
+++	flags = octeon_crypto_enable(&state);
+++	octeon_des3_ecb_blocks(crypto_tfm_ctx(tfm), dst, src, 1, enc);
+++	octeon_crypto_disable(&state, flags);
+++}
+++
+++static void octeon_des3_cipher_encrypt(struct crypto_tfm *tfm, u8 *dst,
+++				       const u8 *src)
+++{
+++	octeon_des3_cipher_crypt(tfm, dst, src, true);
+++}
+++
+++static void octeon_des3_cipher_decrypt(struct crypto_tfm *tfm, u8 *dst,
+++				       const u8 *src)
+++{
+++	octeon_des3_cipher_crypt(tfm, dst, src, false);
+++}
+++
+++static struct crypto_alg octeon_des3_cipher_alg = {
+++	.cra_name		= "des3_ede",
+++	.cra_driver_name	= "des3_ede-octeon",
+++	.cra_priority		= OCTEON_CR_OPCODE_PRIORITY,
+++	.cra_flags		= CRYPTO_ALG_TYPE_CIPHER,
+++	.cra_blocksize		= DES3_EDE_BLOCK_SIZE,
+++	.cra_ctxsize		= sizeof(struct octeon_des3_ctx),
+++	.cra_module		= THIS_MODULE,
+++	.cra_u.cipher = {
+++		.cia_min_keysize	= DES3_EDE_KEY_SIZE,
+++		.cia_max_keysize	= DES3_EDE_KEY_SIZE,
+++		.cia_setkey		= octeon_des3_cipher_setkey,
+++		.cia_encrypt		= octeon_des3_cipher_encrypt,
+++		.cia_decrypt		= octeon_des3_cipher_decrypt,
+++	},
+++};
+++
+++/* ---- ecb(des3_ede), cbc(des3_ede) ---- */
+++
+++static int octeon_des3_sk_setkey(struct crypto_skcipher *tfm, const u8 *key,
+++				 unsigned int keylen)
+++{
+++	int err = verify_skcipher_des3_key(tfm, key);
+++
+++	if (err)
+++		return err;
+++	octeon_des3_expand(crypto_skcipher_ctx(tfm), key);
+++	return 0;
+++}
+++
+++static int octeon_des3_sk_crypt(struct skcipher_request *req, bool cbc,
+++				bool enc)
+++{
+++	struct octeon_des3_ctx *ctx =
+++		crypto_skcipher_ctx(crypto_skcipher_reqtfm(req));
+++	struct octeon_cop2_state state;
+++	struct skcipher_walk walk;
+++	unsigned long flags;
+++	unsigned int nbytes;
+++	int err;
+++
+++	err = skcipher_walk_virt(&walk, req, false);
+++	while ((nbytes = walk.nbytes)) {
+++		unsigned int nblocks = nbytes / DES3_EDE_BLOCK_SIZE;
+++
+++		flags = octeon_crypto_enable(&state);
+++		if (cbc)
+++			octeon_des3_cbc_blocks(ctx, walk.dst.virt.addr,
+++					       walk.src.virt.addr, nblocks,
+++					       walk.iv, enc);
+++		else
+++			octeon_des3_ecb_blocks(ctx, walk.dst.virt.addr,
+++					       walk.src.virt.addr, nblocks, enc);
+++		octeon_crypto_disable(&state, flags);
+++		err = skcipher_walk_done(&walk, nbytes % DES3_EDE_BLOCK_SIZE);
+++	}
+++	return err;
+++}
+++
+++static int octeon_des3_ecb_encrypt(struct skcipher_request *req)
+++{
+++	return octeon_des3_sk_crypt(req, false, true);
+++}
+++
+++static int octeon_des3_ecb_decrypt(struct skcipher_request *req)
+++{
+++	return octeon_des3_sk_crypt(req, false, false);
+++}
+++
+++static int octeon_des3_cbc_encrypt(struct skcipher_request *req)
+++{
+++	return octeon_des3_sk_crypt(req, true, true);
+++}
+++
+++static int octeon_des3_cbc_decrypt(struct skcipher_request *req)
+++{
+++	return octeon_des3_sk_crypt(req, true, false);
+++}
+++
+++static struct skcipher_alg octeon_des3_sk_algs[] = {
+++	{
+++		.base.cra_name		= "ecb(des3_ede)",
+++		.base.cra_driver_name	= "ecb-des3_ede-octeon",
+++		.base.cra_priority	= OCTEON_CR_OPCODE_PRIORITY,
+++		.base.cra_blocksize	= DES3_EDE_BLOCK_SIZE,
+++		.base.cra_ctxsize	= sizeof(struct octeon_des3_ctx),
+++		.base.cra_module	= THIS_MODULE,
+++		.min_keysize		= DES3_EDE_KEY_SIZE,
+++		.max_keysize		= DES3_EDE_KEY_SIZE,
+++		.setkey			= octeon_des3_sk_setkey,
+++		.encrypt		= octeon_des3_ecb_encrypt,
+++		.decrypt		= octeon_des3_ecb_decrypt,
+++	}, {
+++		.base.cra_name		= "cbc(des3_ede)",
+++		.base.cra_driver_name	= "cbc-des3_ede-octeon",
+++		.base.cra_priority	= OCTEON_CR_OPCODE_PRIORITY,
+++		.base.cra_blocksize	= DES3_EDE_BLOCK_SIZE,
+++		.base.cra_ctxsize	= sizeof(struct octeon_des3_ctx),
+++		.base.cra_module	= THIS_MODULE,
+++		.min_keysize		= DES3_EDE_KEY_SIZE,
+++		.max_keysize		= DES3_EDE_KEY_SIZE,
+++		.ivsize			= DES3_EDE_BLOCK_SIZE,
+++		.setkey			= octeon_des3_sk_setkey,
+++		.encrypt		= octeon_des3_cbc_encrypt,
+++		.decrypt		= octeon_des3_cbc_decrypt,
+++	},
+++};
+++
+++/*
+++ * Cross-check ECB and CBC (both directions, in place, split calls) against
+++ * des3_ede-generic with random keys and data.
+++ */
+++static int octeon_des3_check(void)
+++{
+++	struct octeon_cop2_state state;
+++	struct octeon_des3_ctx ctx;
+++	struct crypto_cipher *gen;
+++	u8 key[DES3_EDE_KEY_SIZE], iv0[8], iv[8], prev[8];
+++	u8 *src, *hw, *ref;
+++	unsigned long flags;
+++	int round, j, bad = 0;
+++	const unsigned int len = 40 * DES3_EDE_BLOCK_SIZE, half = 17 * 8;
+++
+++	gen = crypto_alloc_cipher("des3_ede-generic", 0, 0);
+++	if (IS_ERR(gen))
+++		return PTR_ERR(gen);
+++	src = kmalloc(3 * len, GFP_KERNEL);
+++	if (!src) {
+++		crypto_free_cipher(gen);
+++		return -ENOMEM;
+++	}
+++	hw = src + len;
+++	ref = hw + len;
+++
+++	for (round = 0; round < 4 && !bad; round++) {
+++		do {
+++			get_random_bytes(key, sizeof(key));
+++		} while (crypto_cipher_setkey(gen, key, sizeof(key)));
+++		get_random_bytes(iv0, sizeof(iv0));
+++		get_random_bytes(src, len);
+++		octeon_des3_expand(&ctx, key);
+++
+++		/* ECB encrypt */
+++		for (j = 0; j < len; j += 8)
+++			crypto_cipher_encrypt_one(gen, ref + j, src + j);
+++		flags = octeon_crypto_enable(&state);
+++		octeon_des3_ecb_blocks(&ctx, hw, src, len / 8, true);
+++		octeon_crypto_disable(&state, flags);
+++		bad |= !!memcmp(hw, ref, len);
+++
+++		/* ECB decrypt, in place */
+++		flags = octeon_crypto_enable(&state);
+++		octeon_des3_ecb_blocks(&ctx, hw, hw, len / 8, false);
+++		octeon_crypto_disable(&state, flags);
+++		bad |= !!memcmp(hw, src, len);
+++
+++		/* CBC encrypt reference */
+++		memcpy(prev, iv0, 8);
+++		for (j = 0; j < len; j += 8) {
+++			crypto_xor_cpy(ref + j, src + j, prev, 8);
+++			crypto_cipher_encrypt_one(gen, ref + j, ref + j);
+++			memcpy(prev, ref + j, 8);
+++		}
+++		/* CBC encrypt, two calls to check IV hand-over */
+++		memcpy(iv, iv0, 8);
+++		flags = octeon_crypto_enable(&state);
+++		octeon_des3_cbc_blocks(&ctx, hw, src, half / 8, iv, true);
+++		octeon_des3_cbc_blocks(&ctx, hw + half, src + half,
+++				       (len - half) / 8, iv, true);
+++		octeon_crypto_disable(&state, flags);
+++		bad |= !!memcmp(hw, ref, len) || !!memcmp(iv, ref + len - 8, 8);
+++
+++		/* CBC decrypt, in place, two calls */
+++		memcpy(iv, iv0, 8);
+++		flags = octeon_crypto_enable(&state);
+++		octeon_des3_cbc_blocks(&ctx, hw, hw, half / 8, iv, false);
+++		octeon_des3_cbc_blocks(&ctx, hw + half, hw + half,
+++				       (len - half) / 8, iv, false);
+++		octeon_crypto_disable(&state, flags);
+++		bad |= !!memcmp(hw, src, len) || !!memcmp(iv, ref + len - 8, 8);
+++		if (bad)
+++			pr_err("octeon-des3: mismatch vs des3_ede-generic (round %d)\n",
+++			       round);
+++	}
+++	memzero_explicit(&ctx, sizeof(ctx));
+++	memzero_explicit(key, sizeof(key));
+++	kfree(src);
+++	crypto_free_cipher(gen);
+++	return bad ? -EIO : 0;
+++}
+++
+++static int __init octeon_des3_mod_init(void)
+++{
+++	int err;
+++
+++	if (!octeon_has_crypto())
+++		return -ENOTSUPP;
+++	err = octeon_des3_check();
+++	if (err)
+++		return err;
+++	pr_info("octeon-des3: self-test against des3_ede-generic passed\n");
+++
+++	err = crypto_register_alg(&octeon_des3_cipher_alg);
+++	if (err)
+++		return err;
+++	err = crypto_register_skciphers(octeon_des3_sk_algs,
+++					ARRAY_SIZE(octeon_des3_sk_algs));
+++	if (err)
+++		crypto_unregister_alg(&octeon_des3_cipher_alg);
+++	return err;
+++}
+++
+++static void __exit octeon_des3_mod_exit(void)
+++{
+++	crypto_unregister_skciphers(octeon_des3_sk_algs,
+++				    ARRAY_SIZE(octeon_des3_sk_algs));
+++	crypto_unregister_alg(&octeon_des3_cipher_alg);
+++}
+++
+++module_init(octeon_des3_mod_init);
+++module_exit(octeon_des3_mod_exit);
+++
+++MODULE_LICENSE("GPL");
+++MODULE_DESCRIPTION("Triple DES, ECB and CBC using the OCTEON crypto coprocessor");
+++MODULE_IMPORT_NS(CRYPTO_INTERNAL);
+++MODULE_ALIAS_CRYPTO("des3_ede");
+++MODULE_ALIAS_CRYPTO("des3_ede-octeon");
+++MODULE_ALIAS_CRYPTO("ecb(des3_ede)");
+++MODULE_ALIAS_CRYPTO("cbc(des3_ede)");
++diff -Nurp a/arch/mips/cavium-octeon/crypto/octeon-ghash.c b/arch/mips/cavium-octeon/crypto/octeon-ghash.c
++--- a/arch/mips/cavium-octeon/crypto/octeon-ghash.c	1970-01-01 10:00:00.000000000 +1000
+++++ b/arch/mips/cavium-octeon/crypto/octeon-ghash.c	2026-11-12 09:15:30.014922248 +1100
++@@ -0,0 +1,239 @@
+++// SPDX-License-Identifier: GPL-2.0
+++/*
+++ * GHASH (the GCM authentication hash) using the OCTEON Galois-field
+++ * multiplier in the crypto coprocessor (COP2). With ctr-aes-octeon the
+++ * generic gcm template then runs AES-GCM entirely on the crypto unit.
+++ *
+++ * COP2 register selectors as used by the Cavium OCTEON SDK (cvmx-asm.h):
+++ *   0x0258-0x0259  GFM multiplier (the hash key H)
+++ *   0x025a-0x025b  GFM result / input (the running hash Y)
+++ *   0x025c         XOR into Y, high dword
+++ *   0x425d         XOR into Y, low dword, then Y = Y * H
+++ *   0x025e         GFM polynomial (0xe100 for the GCM field)
+++ *
+++ * Same buffering semantics as crypto/ghash-generic.c. The module compares
+++ * itself against ghash-generic at load and refuses to register on mismatch.
+++ */
+++
+++#include <crypto/ghash.h>
+++#include <crypto/internal/hash.h>
+++#include <linux/kernel.h>
+++#include <linux/module.h>
+++#include <linux/random.h>
+++#include <linux/slab.h>
+++#include <linux/unaligned.h>
+++#include <asm/octeon/octeon.h>
+++
+++#include "octeon-crypto.h"
+++
+++#define OCT_MT(val, sel) \
+++	__asm__ __volatile__("dmtc2 %[rt]," #sel : : [rt] "d" ((u64)(val)))
+++#define OCT_MF(sel) ({ u64 __v; \
+++	__asm__ __volatile__("dmfc2 %[rt]," #sel : [rt] "=d" (__v)); __v; })
+++
+++struct ghash_octeon_key {
+++	u64 h[2];
+++};
+++
+++struct ghash_octeon_desc {
+++	u8 buffer[GHASH_BLOCK_SIZE];	/* running hash Y */
+++	u32 bytes;			/* bytes still missing from a block */
+++};
+++
+++static const u8 zero_block[GHASH_BLOCK_SIZE];
+++
+++/* Y = (Y ^ X1) * H, (Y ^ X2) * H, ... over nblocks blocks of src. */
+++static void ghash_octeon_blocks(const struct ghash_octeon_key *k, u8 *y,
+++				const u8 *src, unsigned int nblocks)
+++{
+++	struct octeon_cop2_state state;
+++	unsigned long flags;
+++
+++	flags = octeon_crypto_enable(&state);
+++	OCT_MT(0xe100, 0x025e);
+++	OCT_MT(k->h[0], 0x0258);
+++	OCT_MT(k->h[1], 0x0259);
+++	OCT_MT(get_unaligned_be64(y), 0x025a);
+++	OCT_MT(get_unaligned_be64(y + 8), 0x025b);
+++	while (nblocks--) {
+++		OCT_MT(get_unaligned_be64(src), 0x025c);
+++		OCT_MT(get_unaligned_be64(src + 8), 0x425d);
+++		src += GHASH_BLOCK_SIZE;
+++	}
+++	put_unaligned_be64(OCT_MF(0x025a), y);
+++	put_unaligned_be64(OCT_MF(0x025b), y + 8);
+++	octeon_crypto_disable(&state, flags);
+++}
+++
+++static int ghash_octeon_setkey(struct crypto_shash *tfm, const u8 *key,
+++			       unsigned int keylen)
+++{
+++	struct ghash_octeon_key *k = crypto_shash_ctx(tfm);
+++
+++	if (keylen != GHASH_BLOCK_SIZE)
+++		return -EINVAL;
+++	k->h[0] = get_unaligned_be64(key);
+++	k->h[1] = get_unaligned_be64(key + 8);
+++	return 0;
+++}
+++
+++static int ghash_octeon_init(struct shash_desc *desc)
+++{
+++	struct ghash_octeon_desc *d = shash_desc_ctx(desc);
+++
+++	memset(d, 0, sizeof(*d));
+++	return 0;
+++}
+++
+++static void __ghash_octeon_update(const struct ghash_octeon_key *k,
+++				  struct ghash_octeon_desc *d,
+++				  const u8 *src, unsigned int srclen)
+++{
+++	u8 *dst = d->buffer;
+++
+++	if (d->bytes) {
+++		unsigned int n = min(srclen, d->bytes);
+++		u8 *pos = dst + (GHASH_BLOCK_SIZE - d->bytes);
+++
+++		d->bytes -= n;
+++		srclen -= n;
+++		while (n--)
+++			*pos++ ^= *src++;
+++		if (!d->bytes)
+++			ghash_octeon_blocks(k, dst, zero_block, 1);
+++	}
+++	if (srclen >= GHASH_BLOCK_SIZE) {
+++		unsigned int nblocks = srclen / GHASH_BLOCK_SIZE;
+++
+++		ghash_octeon_blocks(k, dst, src, nblocks);
+++		src += nblocks * GHASH_BLOCK_SIZE;
+++		srclen -= nblocks * GHASH_BLOCK_SIZE;
+++	}
+++	if (srclen) {
+++		d->bytes = GHASH_BLOCK_SIZE - srclen;
+++		while (srclen--)
+++			*dst++ ^= *src++;
+++	}
+++}
+++
+++static void __ghash_octeon_final(const struct ghash_octeon_key *k,
+++				 struct ghash_octeon_desc *d, u8 *out)
+++{
+++	if (d->bytes)
+++		ghash_octeon_blocks(k, d->buffer, zero_block, 1);
+++	memcpy(out, d->buffer, GHASH_DIGEST_SIZE);
+++	memzero_explicit(d, sizeof(*d));
+++}
+++
+++static int ghash_octeon_update(struct shash_desc *desc, const u8 *src,
+++			       unsigned int srclen)
+++{
+++	__ghash_octeon_update(crypto_shash_ctx(desc->tfm), shash_desc_ctx(desc),
+++			      src, srclen);
+++	return 0;
+++}
+++
+++static int ghash_octeon_final(struct shash_desc *desc, u8 *out)
+++{
+++	__ghash_octeon_final(crypto_shash_ctx(desc->tfm), shash_desc_ctx(desc),
+++			     out);
+++	return 0;
+++}
+++
+++static struct shash_alg ghash_octeon_alg = {
+++	.digestsize	= GHASH_DIGEST_SIZE,
+++	.init		= ghash_octeon_init,
+++	.update		= ghash_octeon_update,
+++	.final		= ghash_octeon_final,
+++	.setkey		= ghash_octeon_setkey,
+++	.descsize	= sizeof(struct ghash_octeon_desc),
+++	.base = {
+++		.cra_name		= "ghash",
+++		.cra_driver_name	= "ghash-octeon",
+++		.cra_priority		= OCTEON_CR_OPCODE_PRIORITY,
+++		.cra_blocksize		= GHASH_BLOCK_SIZE,
+++		.cra_ctxsize		= sizeof(struct ghash_octeon_key),
+++		.cra_module		= THIS_MODULE,
+++	},
+++};
+++
+++/* Cross-check against ghash-generic with odd update splits. */
+++static int ghash_octeon_check(void)
+++{
+++	static const unsigned int splits[][3] = {
+++		{ 16, 0, 0 }, { 5, 0, 0 }, { 3, 13, 16 }, { 100, 7, 200 },
+++		{ 1, 1, 1 }, { 64, 64, 1 }, { 17, 31, 47 },
+++	};
+++	struct ghash_octeon_desc dh;
+++	struct ghash_octeon_key kh;
+++	struct crypto_shash *gen;
+++	u8 key[16], out_g[16], out_h[16], *data;
+++	int i, j, bad = 0, err;
+++
+++	gen = crypto_alloc_shash("ghash-generic", 0, 0);
+++	if (IS_ERR(gen))
+++		return PTR_ERR(gen);
+++	data = kmalloc(512, GFP_KERNEL);
+++	if (!data) {
+++		err = -ENOMEM;
+++		goto out;
+++	}
+++	for (i = 0; i < ARRAY_SIZE(splits) && !bad; i++) {
+++		SHASH_DESC_ON_STACK(dg, gen);
+++
+++		get_random_bytes(key, sizeof(key));
+++		get_random_bytes(data, 512);
+++		crypto_shash_setkey(gen, key, 16);
+++		kh.h[0] = get_unaligned_be64(key);
+++		kh.h[1] = get_unaligned_be64(key + 8);
+++		dg->tfm = gen;
+++		crypto_shash_init(dg);
+++		memset(&dh, 0, sizeof(dh));
+++		for (j = 0; j < 3; j++) {
+++			unsigned int off = splits[i][0] * (j > 0) + splits[i][1] * (j > 1);
+++
+++			crypto_shash_update(dg, data + off, splits[i][j]);
+++			__ghash_octeon_update(&kh, &dh, data + off, splits[i][j]);
+++		}
+++		crypto_shash_final(dg, out_g);
+++		__ghash_octeon_final(&kh, &dh, out_h);
+++		if (memcmp(out_g, out_h, 16)) {
+++			pr_err("octeon-ghash: mismatch vs ghash-generic (case %d)\n", i);
+++			pr_err("octeon-ghash: generic %16phN octeon %16phN\n",
+++			       out_g, out_h);
+++			bad = 1;
+++		}
+++	}
+++	err = bad ? -EIO : 0;
+++	kfree(data);
+++	memzero_explicit(&kh, sizeof(kh));
+++out:
+++	crypto_free_shash(gen);
+++	return err;
+++}
+++
+++static int __init ghash_octeon_mod_init(void)
+++{
+++	int err;
+++
+++	if (!octeon_has_crypto())
+++		return -ENOTSUPP;
+++	err = ghash_octeon_check();
+++	if (err)
+++		return err;
+++	pr_info("octeon-ghash: self-test against ghash-generic passed\n");
+++	return crypto_register_shash(&ghash_octeon_alg);
+++}
+++
+++static void __exit ghash_octeon_mod_exit(void)
+++{
+++	crypto_unregister_shash(&ghash_octeon_alg);
+++}
+++
+++module_init(ghash_octeon_mod_init);
+++module_exit(ghash_octeon_mod_exit);
+++
+++MODULE_LICENSE("GPL");
+++MODULE_DESCRIPTION("GHASH using the OCTEON crypto coprocessor");
+++MODULE_ALIAS_CRYPTO("ghash");
+++MODULE_ALIAS_CRYPTO("ghash-octeon");
 +diff -Nurp a/arch/mips/crypto/Kconfig b/arch/mips/crypto/Kconfig
 +--- a/arch/mips/crypto/Kconfig	2026-11-11 11:53:16.984067996 +1100
-++++ b/arch/mips/crypto/Kconfig	2026-11-11 11:53:17.043606919 +1100
-+@@ -22,6 +22,17 @@ config CRYPTO_POLY1305_MIPS
+++++ b/arch/mips/crypto/Kconfig	2026-11-12 09:15:30.044903311 +1100
++@@ -22,6 +22,42 @@ config CRYPTO_POLY1305_MIPS
 + 
 + 	  Architecture: mips
 + 
 ++config CRYPTO_AES_OCTEON
-++	tristate "Ciphers: AES, modes: ECB, CBC (OCTEON)"
+++	tristate "Ciphers: AES, modes: ECB, CBC, CTR (OCTEON)"
 ++	depends on CPU_CAVIUM_OCTEON
 ++	select CRYPTO_ALGAPI
 ++	select CRYPTO_SKCIPHER
 ++	help
-++	  Block cipher: AES cipher algorithms (FIPS-197), with ECB and CBC
-++	  modes, using the OCTEON crypto coprocessor.
+++	  Block cipher: AES cipher algorithms (FIPS-197), with ECB, CBC and
+++	  CTR modes, using the OCTEON crypto coprocessor.
+++
+++	  Architecture: mips OCTEON using crypto instructions, when available
+++
+++config CRYPTO_GHASH_OCTEON
+++	tristate "Hash functions: GHASH (OCTEON)"
+++	depends on CPU_CAVIUM_OCTEON
+++	select CRYPTO_HASH
+++	select CRYPTO_GHASH
+++	help
+++	  GCM GHASH function (NIST SP800-38D) using the Galois-field
+++	  multiplier of the OCTEON crypto coprocessor. With CRYPTO_AES_OCTEON
+++	  the gcm(aes) template runs entirely on the crypto unit.
+++
+++	  Architecture: mips OCTEON using crypto instructions, when available
+++
+++config CRYPTO_DES3_OCTEON
+++	tristate "Ciphers: Triple DES EDE, modes: ECB, CBC (OCTEON)"
+++	depends on CPU_CAVIUM_OCTEON
+++	select CRYPTO_ALGAPI
+++	select CRYPTO_SKCIPHER
+++	select CRYPTO_LIB_DES
+++	select CRYPTO_DES
+++	help
+++	  Block cipher: Triple DES EDE (FIPS 46-3, ANSI X9.52), with ECB and
+++	  CBC modes, using the OCTEON crypto coprocessor.
 ++
 ++	  Architecture: mips OCTEON using crypto instructions, when available
 ++
@@ -2652,3 +3499,275 @@ index 0000000..4e1b148
 + 		.arl_bins = 4,
 + 		.arl_buckets = 1024,
 + 		.vta_regs = B53_VTA_REGS,
+diff --git a/target/linux/octeon/patches-6.12/176-crypto-mips-chacha-64bit.patch b/target/linux/octeon/patches-6.12/176-crypto-mips-chacha-64bit.patch
+new file mode 100755
+index 0000000..e71e458
+--- /dev/null
++++ b/target/linux/octeon/patches-6.12/176-crypto-mips-chacha-64bit.patch
+@@ -0,0 +1,266 @@
++From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
++Subject: [PATCH] crypto: mips/chacha - support the 64-bit OCTEON (n64 ABI)
++
++The MIPS ChaCha core only builds for MIPS32r2 (o32). OCTEON is a 64-bit
++MIPS64r2 core with the same wsbh/rotr/lwl/lwr instructions, so the code
++carries over with ABI fixes only: n64 has no t4-t7 register names (use
++the numeric registers), nrounds arrives in a4 rather than on the stack,
++s0-s7 must be saved as 64-bit values, pointer arithmetic must be 64-bit
++and the jump-table address is formed with PTR_LA. o32 output is unchanged.
++
++On a 500 MHz CN5010: chacha20 46.7 MB/s vs 33.3 MB/s generic (1420-byte
++blocks), rfc7539esp(chacha20,poly1305) 29.1 vs 23.1 MB/s. WireGuard uses
++it through the ChaCha library interface.
++
++diff -Nurp a/arch/mips/crypto/Kconfig b/arch/mips/crypto/Kconfig
++--- a/arch/mips/crypto/Kconfig	2026-11-12 09:53:31.999330508 +1100
+++++ b/arch/mips/crypto/Kconfig	2026-11-12 09:53:32.013911278 +1100
++@@ -100,7 +100,7 @@ config CRYPTO_SHA512_OCTEON
++ 
++ config CRYPTO_CHACHA_MIPS
++ 	tristate
++-	depends on CPU_MIPS32_R2
+++	depends on CPU_MIPS32_R2 || CPU_CAVIUM_OCTEON
++ 	select CRYPTO_SKCIPHER
++ 	select CRYPTO_ARCH_HAVE_LIB_CHACHA
++ 	default CRYPTO_LIB_CHACHA_INTERNAL
++@@ -108,6 +108,6 @@ config CRYPTO_CHACHA_MIPS
++ 	  Length-preserving ciphers: ChaCha20, XChaCha20, and XChaCha12
++ 	  stream cipher algorithms
++ 
++-	  Architecture: MIPS32r2
+++	  Architecture: MIPS32r2, MIPS64 OCTEON
++ 
++ endmenu
++diff -Nurp a/arch/mips/crypto/chacha-core.S b/arch/mips/crypto/chacha-core.S
++--- a/arch/mips/crypto/chacha-core.S	2026-11-12 09:53:31.998971585 +1100
+++++ b/arch/mips/crypto/chacha-core.S	2026-11-12 09:53:32.010370858 +1100
++@@ -6,16 +6,30 @@
++ 
++ #define MASK_U32		0x3c
++ #define CHACHA20_BLOCK_SIZE	64
+++#include <asm/asm.h>
+++
+++/*
+++ * o32: s0-s7 saved as 32-bit words, nrounds is the 5th argument on the
+++ * caller's stack. n64: s0-s7 are 64-bit, nrounds arrives in a4 ($8) and
+++ * is kept in our own frame. Pointers are 64-bit, so pointer arithmetic
+++ * uses PTR_ADDU/PTR_ADDIU and the jump tables are reached with PTR_LA.
+++ */
+++#if _MIPS_SIM == _MIPS_SIM_ABI32
++ #define STACK_SIZE		32
+++#define NROUNDS_OFF		(STACK_SIZE + 16)
+++#else
+++#define STACK_SIZE		80
+++#define NROUNDS_OFF		64
+++#endif
++ 
++-#define X0	$t0
++-#define X1	$t1
++-#define X2	$t2
++-#define X3	$t3
++-#define X4	$t4
++-#define X5	$t5
++-#define X6	$t6
++-#define X7	$t7
+++#define X0	$8
+++#define X1	$9
+++#define X2	$10
+++#define X3	$11
+++#define X4	$12
+++#define X5	$13
+++#define X6	$14
+++#define X7	$15
++ #define X8	$t8
++ #define X9	$t9
++ #define X10	$v1
++@@ -201,10 +215,17 @@ CONCAT3(.Lchacha_mips_xor_aligned_, PLUS
++ chacha_crypt_arch:
++ 	.frame	$sp, STACK_SIZE, $ra
++ 
+++#if _MIPS_SIM == _MIPS_SIM_ABI32
++ 	/* Load number of rounds */
++ 	lw	$at, 16($sp)
++ 
++ 	addiu	$sp, -STACK_SIZE
+++#else
+++	PTR_ADDIU	$sp, -STACK_SIZE
+++	/* Number of rounds is in a4 ($8 = X0): keep it in the frame */
+++	move	$at, $8
+++	sw	$8, NROUNDS_OFF($sp)
+++#endif
++ 
++ 	/* Return bytes = 0. */
++ 	beqz	BYTES, .Lchacha_mips_end
++@@ -212,14 +233,14 @@ chacha_crypt_arch:
++ 	lw	NONCE_0, 48(STATE)
++ 
++ 	/* Save s0-s7 */
++-	sw	$s0,  0($sp)
++-	sw	$s1,  4($sp)
++-	sw	$s2,  8($sp)
++-	sw	$s3, 12($sp)
++-	sw	$s4, 16($sp)
++-	sw	$s5, 20($sp)
++-	sw	$s6, 24($sp)
++-	sw	$s7, 28($sp)
+++	LONG_S	$s0, (0*SZREG)($sp)
+++	LONG_S	$s1, (1*SZREG)($sp)
+++	LONG_S	$s2, (2*SZREG)($sp)
+++	LONG_S	$s3, (3*SZREG)($sp)
+++	LONG_S	$s4, (4*SZREG)($sp)
+++	LONG_S	$s5, (5*SZREG)($sp)
+++	LONG_S	$s6, (6*SZREG)($sp)
+++	LONG_S	$s7, (7*SZREG)($sp)
++ 
++ 	/* Test IN or OUT is unaligned.
++ 	 * IS_UNALIGNED = ( IN | OUT ) & 0x00000003
++@@ -231,8 +252,8 @@ chacha_crypt_arch:
++ 
++ .align 4
++ .Loop_chacha_rounds:
++-	addiu	IN,  CHACHA20_BLOCK_SIZE
++-	addiu	OUT, CHACHA20_BLOCK_SIZE
+++	PTR_ADDIU	IN,  CHACHA20_BLOCK_SIZE
+++	PTR_ADDIU	OUT, CHACHA20_BLOCK_SIZE
++ 	addiu	NONCE_0, 1
++ 
++ .Lchacha_rounds_start:
++@@ -273,7 +294,7 @@ chacha_crypt_arch:
++ 	bnez	IS_UNALIGNED, .Loop_chacha_unaligned
++ 
++ 	/* Set number rounds here to fill delayslot. */
++-	lw	$at, (STACK_SIZE+16)($sp)
+++	lw	$at, NROUNDS_OFF($sp)
++ 
++ 	/* BYTES < 0, it has no full block. */
++ 	bltz	BYTES, .Lchacha_mips_no_full_block_aligned
++@@ -291,20 +312,20 @@ chacha_crypt_arch:
++ 
++ .Lchacha_mips_xor_done:
++ 	/* Restore used registers */
++-	lw	$s0,  0($sp)
++-	lw	$s1,  4($sp)
++-	lw	$s2,  8($sp)
++-	lw	$s3, 12($sp)
++-	lw	$s4, 16($sp)
++-	lw	$s5, 20($sp)
++-	lw	$s6, 24($sp)
++-	lw	$s7, 28($sp)
+++	LONG_L	$s0, (0*SZREG)($sp)
+++	LONG_L	$s1, (1*SZREG)($sp)
+++	LONG_L	$s2, (2*SZREG)($sp)
+++	LONG_L	$s3, (3*SZREG)($sp)
+++	LONG_L	$s4, (4*SZREG)($sp)
+++	LONG_L	$s5, (5*SZREG)($sp)
+++	LONG_L	$s6, (6*SZREG)($sp)
+++	LONG_L	$s7, (7*SZREG)($sp)
++ 
++ 	/* Write NONCE_0 back to right location in state */
++ 	sw	NONCE_0, 48(STATE)
++ 
++ .Lchacha_mips_end:
++-	addiu	$sp, STACK_SIZE
+++	PTR_ADDIU	$sp, STACK_SIZE
++ 	jr	$ra
++ 
++ .Lchacha_mips_no_full_block_aligned:
++@@ -314,6 +335,7 @@ chacha_crypt_arch:
++ 	/* Get number of full WORDS */
++ 	andi	$at, BYTES, MASK_U32
++ 
+++#if _MIPS_SIM == _MIPS_SIM_ABI32
++ 	/* Load upper half of jump table addr */
++ 	lui	T0, %hi(.Lchacha_mips_jmptbl_aligned_0)
++ 
++@@ -325,6 +347,15 @@ chacha_crypt_arch:
++ 
++ 	/* Add lower half jump table addr */
++ 	addiu	T0, %lo(.Lchacha_mips_jmptbl_aligned_0)
+++#else
+++	/* Add offset to STATE */
+++	PTR_ADDU	T1, STATE, $at
+++
+++	/* Jump table entry: 8 bytes per word, $at = 4 * words */
+++	PTR_LA	T0, .Lchacha_mips_jmptbl_aligned_0
+++	PTR_ADDU	T0, $at
+++	PTR_ADDU	T0, $at
+++#endif
++ 
++ 	/* Read value from STATE */
++ 	lw	SAVED_CA, 0(T1)
++@@ -340,7 +371,7 @@ chacha_crypt_arch:
++ 
++ .Loop_chacha_unaligned:
++ 	/* Set number rounds here to fill delayslot. */
++-	lw	$at, (STACK_SIZE+16)($sp)
+++	lw	$at, NROUNDS_OFF($sp)
++ 
++ 	/* BYTES > 0, it has no full block. */
++ 	bltz	BYTES, .Lchacha_mips_no_full_block_unaligned
++@@ -363,8 +394,8 @@ chacha_crypt_arch:
++ 	.set reorder
++ 
++ .Lchacha_mips_xor_bytes:
++-	addu	IN, $at
++-	addu	OUT, $at
+++	PTR_ADDU	IN, $at
+++	PTR_ADDU	OUT, $at
++ 	/* First byte */
++ 	lbu	T1, 0(IN)
++ 	addiu	$at, BYTES, 1
++@@ -392,6 +423,7 @@ chacha_crypt_arch:
++ 	/* Get number of full WORDS */
++ 	andi	$at, BYTES, MASK_U32
++ 
+++#if _MIPS_SIM == _MIPS_SIM_ABI32
++ 	/* Load upper half of jump table addr */
++ 	lui	T0, %hi(.Lchacha_mips_jmptbl_unaligned_0)
++ 
++@@ -403,6 +435,15 @@ chacha_crypt_arch:
++ 
++ 	/* Add lower half jump table addr */
++ 	addiu	T0, %lo(.Lchacha_mips_jmptbl_unaligned_0)
+++#else
+++	/* Add offset to STATE */
+++	PTR_ADDU	T1, STATE, $at
+++
+++	/* Jump table entry: 8 bytes per word, $at = 4 * words */
+++	PTR_LA	T0, .Lchacha_mips_jmptbl_unaligned_0
+++	PTR_ADDU	T0, $at
+++	PTR_ADDU	T0, $at
+++#endif
++ 
++ 	/* Read value from STATE */
++ 	lw	SAVED_CA, 0(T1)
++@@ -439,10 +480,10 @@ chacha_crypt_arch:
++ hchacha_block_arch:
++ 	.frame	$sp, STACK_SIZE, $ra
++ 
++-	addiu	$sp, -STACK_SIZE
+++	PTR_ADDIU	$sp, -STACK_SIZE
++ 
++ 	/* Save X11(s6) */
++-	sw	X11, 0($sp)
+++	LONG_S	X11, 0($sp)
++ 
++ 	lw	X0,  0(STATE)
++ 	lw	X1,  4(STATE)
++@@ -474,7 +515,7 @@ hchacha_block_arch:
++ 	bnez	$a2, .Loop_hchacha_xor_rounds
++ 
++ 	/* Restore used register */
++-	lw	X11, 0($sp)
+++	LONG_L	X11, 0($sp)
++ 
++ 	sw	X0,  0(OUT)
++ 	sw	X1,  4(OUT)
++@@ -485,7 +526,7 @@ hchacha_block_arch:
++ 	sw	X14, 24(OUT)
++ 	sw	X15, 28(OUT)
++ 
++-	addiu	$sp, STACK_SIZE
+++	PTR_ADDIU	$sp, STACK_SIZE
++ 	jr	$ra
++ .end hchacha_block_arch
++ .set at

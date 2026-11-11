@@ -1,0 +1,266 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] crypto: mips/chacha - support the 64-bit OCTEON (n64 ABI)
+
+The MIPS ChaCha core only builds for MIPS32r2 (o32). OCTEON is a 64-bit
+MIPS64r2 core with the same wsbh/rotr/lwl/lwr instructions, so the code
+carries over with ABI fixes only: n64 has no t4-t7 register names (use
+the numeric registers), nrounds arrives in a4 rather than on the stack,
+s0-s7 must be saved as 64-bit values, pointer arithmetic must be 64-bit
+and the jump-table address is formed with PTR_LA. o32 output is unchanged.
+
+On a 500 MHz CN5010: chacha20 46.7 MB/s vs 33.3 MB/s generic (1420-byte
+blocks), rfc7539esp(chacha20,poly1305) 29.1 vs 23.1 MB/s. WireGuard uses
+it through the ChaCha library interface.
+
+diff -Nurp a/arch/mips/crypto/Kconfig b/arch/mips/crypto/Kconfig
+--- a/arch/mips/crypto/Kconfig	2026-11-12 09:53:31.999330508 +1100
++++ b/arch/mips/crypto/Kconfig	2026-11-12 09:53:32.013911278 +1100
+@@ -100,7 +100,7 @@ config CRYPTO_SHA512_OCTEON
+ 
+ config CRYPTO_CHACHA_MIPS
+ 	tristate
+-	depends on CPU_MIPS32_R2
++	depends on CPU_MIPS32_R2 || CPU_CAVIUM_OCTEON
+ 	select CRYPTO_SKCIPHER
+ 	select CRYPTO_ARCH_HAVE_LIB_CHACHA
+ 	default CRYPTO_LIB_CHACHA_INTERNAL
+@@ -108,6 +108,6 @@ config CRYPTO_CHACHA_MIPS
+ 	  Length-preserving ciphers: ChaCha20, XChaCha20, and XChaCha12
+ 	  stream cipher algorithms
+ 
+-	  Architecture: MIPS32r2
++	  Architecture: MIPS32r2, MIPS64 OCTEON
+ 
+ endmenu
+diff -Nurp a/arch/mips/crypto/chacha-core.S b/arch/mips/crypto/chacha-core.S
+--- a/arch/mips/crypto/chacha-core.S	2026-11-12 09:53:31.998971585 +1100
++++ b/arch/mips/crypto/chacha-core.S	2026-11-12 09:53:32.010370858 +1100
+@@ -6,16 +6,30 @@
+ 
+ #define MASK_U32		0x3c
+ #define CHACHA20_BLOCK_SIZE	64
++#include <asm/asm.h>
++
++/*
++ * o32: s0-s7 saved as 32-bit words, nrounds is the 5th argument on the
++ * caller's stack. n64: s0-s7 are 64-bit, nrounds arrives in a4 ($8) and
++ * is kept in our own frame. Pointers are 64-bit, so pointer arithmetic
++ * uses PTR_ADDU/PTR_ADDIU and the jump tables are reached with PTR_LA.
++ */
++#if _MIPS_SIM == _MIPS_SIM_ABI32
+ #define STACK_SIZE		32
++#define NROUNDS_OFF		(STACK_SIZE + 16)
++#else
++#define STACK_SIZE		80
++#define NROUNDS_OFF		64
++#endif
+ 
+-#define X0	$t0
+-#define X1	$t1
+-#define X2	$t2
+-#define X3	$t3
+-#define X4	$t4
+-#define X5	$t5
+-#define X6	$t6
+-#define X7	$t7
++#define X0	$8
++#define X1	$9
++#define X2	$10
++#define X3	$11
++#define X4	$12
++#define X5	$13
++#define X6	$14
++#define X7	$15
+ #define X8	$t8
+ #define X9	$t9
+ #define X10	$v1
+@@ -201,10 +215,17 @@ CONCAT3(.Lchacha_mips_xor_aligned_, PLUS
+ chacha_crypt_arch:
+ 	.frame	$sp, STACK_SIZE, $ra
+ 
++#if _MIPS_SIM == _MIPS_SIM_ABI32
+ 	/* Load number of rounds */
+ 	lw	$at, 16($sp)
+ 
+ 	addiu	$sp, -STACK_SIZE
++#else
++	PTR_ADDIU	$sp, -STACK_SIZE
++	/* Number of rounds is in a4 ($8 = X0): keep it in the frame */
++	move	$at, $8
++	sw	$8, NROUNDS_OFF($sp)
++#endif
+ 
+ 	/* Return bytes = 0. */
+ 	beqz	BYTES, .Lchacha_mips_end
+@@ -212,14 +233,14 @@ chacha_crypt_arch:
+ 	lw	NONCE_0, 48(STATE)
+ 
+ 	/* Save s0-s7 */
+-	sw	$s0,  0($sp)
+-	sw	$s1,  4($sp)
+-	sw	$s2,  8($sp)
+-	sw	$s3, 12($sp)
+-	sw	$s4, 16($sp)
+-	sw	$s5, 20($sp)
+-	sw	$s6, 24($sp)
+-	sw	$s7, 28($sp)
++	LONG_S	$s0, (0*SZREG)($sp)
++	LONG_S	$s1, (1*SZREG)($sp)
++	LONG_S	$s2, (2*SZREG)($sp)
++	LONG_S	$s3, (3*SZREG)($sp)
++	LONG_S	$s4, (4*SZREG)($sp)
++	LONG_S	$s5, (5*SZREG)($sp)
++	LONG_S	$s6, (6*SZREG)($sp)
++	LONG_S	$s7, (7*SZREG)($sp)
+ 
+ 	/* Test IN or OUT is unaligned.
+ 	 * IS_UNALIGNED = ( IN | OUT ) & 0x00000003
+@@ -231,8 +252,8 @@ chacha_crypt_arch:
+ 
+ .align 4
+ .Loop_chacha_rounds:
+-	addiu	IN,  CHACHA20_BLOCK_SIZE
+-	addiu	OUT, CHACHA20_BLOCK_SIZE
++	PTR_ADDIU	IN,  CHACHA20_BLOCK_SIZE
++	PTR_ADDIU	OUT, CHACHA20_BLOCK_SIZE
+ 	addiu	NONCE_0, 1
+ 
+ .Lchacha_rounds_start:
+@@ -273,7 +294,7 @@ chacha_crypt_arch:
+ 	bnez	IS_UNALIGNED, .Loop_chacha_unaligned
+ 
+ 	/* Set number rounds here to fill delayslot. */
+-	lw	$at, (STACK_SIZE+16)($sp)
++	lw	$at, NROUNDS_OFF($sp)
+ 
+ 	/* BYTES < 0, it has no full block. */
+ 	bltz	BYTES, .Lchacha_mips_no_full_block_aligned
+@@ -291,20 +312,20 @@ chacha_crypt_arch:
+ 
+ .Lchacha_mips_xor_done:
+ 	/* Restore used registers */
+-	lw	$s0,  0($sp)
+-	lw	$s1,  4($sp)
+-	lw	$s2,  8($sp)
+-	lw	$s3, 12($sp)
+-	lw	$s4, 16($sp)
+-	lw	$s5, 20($sp)
+-	lw	$s6, 24($sp)
+-	lw	$s7, 28($sp)
++	LONG_L	$s0, (0*SZREG)($sp)
++	LONG_L	$s1, (1*SZREG)($sp)
++	LONG_L	$s2, (2*SZREG)($sp)
++	LONG_L	$s3, (3*SZREG)($sp)
++	LONG_L	$s4, (4*SZREG)($sp)
++	LONG_L	$s5, (5*SZREG)($sp)
++	LONG_L	$s6, (6*SZREG)($sp)
++	LONG_L	$s7, (7*SZREG)($sp)
+ 
+ 	/* Write NONCE_0 back to right location in state */
+ 	sw	NONCE_0, 48(STATE)
+ 
+ .Lchacha_mips_end:
+-	addiu	$sp, STACK_SIZE
++	PTR_ADDIU	$sp, STACK_SIZE
+ 	jr	$ra
+ 
+ .Lchacha_mips_no_full_block_aligned:
+@@ -314,6 +335,7 @@ chacha_crypt_arch:
+ 	/* Get number of full WORDS */
+ 	andi	$at, BYTES, MASK_U32
+ 
++#if _MIPS_SIM == _MIPS_SIM_ABI32
+ 	/* Load upper half of jump table addr */
+ 	lui	T0, %hi(.Lchacha_mips_jmptbl_aligned_0)
+ 
+@@ -325,6 +347,15 @@ chacha_crypt_arch:
+ 
+ 	/* Add lower half jump table addr */
+ 	addiu	T0, %lo(.Lchacha_mips_jmptbl_aligned_0)
++#else
++	/* Add offset to STATE */
++	PTR_ADDU	T1, STATE, $at
++
++	/* Jump table entry: 8 bytes per word, $at = 4 * words */
++	PTR_LA	T0, .Lchacha_mips_jmptbl_aligned_0
++	PTR_ADDU	T0, $at
++	PTR_ADDU	T0, $at
++#endif
+ 
+ 	/* Read value from STATE */
+ 	lw	SAVED_CA, 0(T1)
+@@ -340,7 +371,7 @@ chacha_crypt_arch:
+ 
+ .Loop_chacha_unaligned:
+ 	/* Set number rounds here to fill delayslot. */
+-	lw	$at, (STACK_SIZE+16)($sp)
++	lw	$at, NROUNDS_OFF($sp)
+ 
+ 	/* BYTES > 0, it has no full block. */
+ 	bltz	BYTES, .Lchacha_mips_no_full_block_unaligned
+@@ -363,8 +394,8 @@ chacha_crypt_arch:
+ 	.set reorder
+ 
+ .Lchacha_mips_xor_bytes:
+-	addu	IN, $at
+-	addu	OUT, $at
++	PTR_ADDU	IN, $at
++	PTR_ADDU	OUT, $at
+ 	/* First byte */
+ 	lbu	T1, 0(IN)
+ 	addiu	$at, BYTES, 1
+@@ -392,6 +423,7 @@ chacha_crypt_arch:
+ 	/* Get number of full WORDS */
+ 	andi	$at, BYTES, MASK_U32
+ 
++#if _MIPS_SIM == _MIPS_SIM_ABI32
+ 	/* Load upper half of jump table addr */
+ 	lui	T0, %hi(.Lchacha_mips_jmptbl_unaligned_0)
+ 
+@@ -403,6 +435,15 @@ chacha_crypt_arch:
+ 
+ 	/* Add lower half jump table addr */
+ 	addiu	T0, %lo(.Lchacha_mips_jmptbl_unaligned_0)
++#else
++	/* Add offset to STATE */
++	PTR_ADDU	T1, STATE, $at
++
++	/* Jump table entry: 8 bytes per word, $at = 4 * words */
++	PTR_LA	T0, .Lchacha_mips_jmptbl_unaligned_0
++	PTR_ADDU	T0, $at
++	PTR_ADDU	T0, $at
++#endif
+ 
+ 	/* Read value from STATE */
+ 	lw	SAVED_CA, 0(T1)
+@@ -439,10 +480,10 @@ chacha_crypt_arch:
+ hchacha_block_arch:
+ 	.frame	$sp, STACK_SIZE, $ra
+ 
+-	addiu	$sp, -STACK_SIZE
++	PTR_ADDIU	$sp, -STACK_SIZE
+ 
+ 	/* Save X11(s6) */
+-	sw	X11, 0($sp)
++	LONG_S	X11, 0($sp)
+ 
+ 	lw	X0,  0(STATE)
+ 	lw	X1,  4(STATE)
+@@ -474,7 +515,7 @@ hchacha_block_arch:
+ 	bnez	$a2, .Loop_hchacha_xor_rounds
+ 
+ 	/* Restore used register */
+-	lw	X11, 0($sp)
++	LONG_L	X11, 0($sp)
+ 
+ 	sw	X0,  0(OUT)
+ 	sw	X1,  4(OUT)
+@@ -485,7 +526,7 @@ hchacha_block_arch:
+ 	sw	X14, 24(OUT)
+ 	sw	X15, 28(OUT)
+ 
+-	addiu	$sp, STACK_SIZE
++	PTR_ADDIU	$sp, STACK_SIZE
+ 	jr	$ra
+ .end hchacha_block_arch
+ .set at

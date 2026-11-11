@@ -598,6 +598,12 @@ ifeq ($(CONFIG_CPU_MIPS32_R2),y)
 	  $(KernelPackage/crypto-lib-chacha20/mips32r2)
 endif
 
+# 64-bit OCTEON: the same core, ported to the n64 ABI (patch 176)
+ifeq ($(CONFIG_TARGET_octeon),y)
+  KernelPackage/crypto-lib-chacha20/$(ARCH)=\
+	  $(KernelPackage/crypto-lib-chacha20/mips32r2)
+endif
+
 ifdef KernelPackage/crypto-lib-chacha20/$(ARCH)
   KernelPackage/crypto-lib-chacha20/$(CRYPTO_TARGET)=\
 	  $(KernelPackage/crypto-lib-chacha20/$(ARCH))
@@ -1209,7 +1215,7 @@ $(eval $(call KernelPackage,crypto-xxhash))
 
 
 define KernelPackage/crypto-aes-octeon
-  TITLE:=AES cipher, ECB and CBC using the OCTEON crypto unit
+  TITLE:=AES cipher, ECB, CBC and CTR using the OCTEON crypto unit
   DEPENDS:=@TARGET_octeon +kmod-crypto-manager
   KCONFIG:=CONFIG_CRYPTO_AES_OCTEON
   FILES:=$(LINUX_DIR)/arch/mips/cavium-octeon/crypto/octeon-aes.ko
@@ -1224,3 +1230,38 @@ define KernelPackage/crypto-aes-octeon/description
 endef
 
 $(eval $(call KernelPackage,crypto-aes-octeon))
+
+
+define KernelPackage/crypto-ghash-octeon
+  TITLE:=GHASH using the OCTEON crypto unit
+  DEPENDS:=@TARGET_octeon +kmod-crypto-ghash +kmod-crypto-hash
+  KCONFIG:=CONFIG_CRYPTO_GHASH_OCTEON
+  FILES:=$(LINUX_DIR)/arch/mips/cavium-octeon/crypto/octeon-ghash.ko
+  AUTOLOAD:=$(call AutoLoad,09,octeon-ghash)
+  $(call AddDepends/crypto)
+endef
+
+define KernelPackage/crypto-ghash-octeon/description
+  GCM GHASH using the OCTEON Galois-field multiplier; with
+  kmod-crypto-aes-octeon, AES-GCM runs entirely on the crypto unit.
+endef
+
+$(eval $(call KernelPackage,crypto-ghash-octeon))
+
+
+define KernelPackage/crypto-des3-octeon
+  TITLE:=Triple DES, ECB and CBC using the OCTEON crypto unit
+  DEPENDS:=@TARGET_octeon +kmod-crypto-des +kmod-crypto-manager
+  KCONFIG:=CONFIG_CRYPTO_DES3_OCTEON
+  FILES:=$(LINUX_DIR)/arch/mips/cavium-octeon/crypto/octeon-des3.ko
+  # not autoloaded: enable with "option des3 '1'" in /etc/config/octeon_accel
+  $(call AddDepends/crypto)
+endef
+
+define KernelPackage/crypto-des3-octeon/description
+  3DES-EDE block cipher plus ECB and CBC using the OCTEON crypto unit,
+  for old VPN peers. Loaded only when enabled in
+  /etc/config/octeon_accel (option des3 '1').
+endef
+
+$(eval $(call KernelPackage,crypto-des3-octeon))

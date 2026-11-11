@@ -29,7 +29,8 @@ replaces it with a current Linux 6.12 kernel, nftables firewall, WPA3 and LuCI o
 | DS1337 battery-backed clock | ✅ |
 | USB 2.0: storage (ext4, FAT, exFAT, NTFS), printer, phone tethering | ✅ drivers in image |
 | CPU usage on the LuCI overview page | ✅ |
-| AES in the Octeon crypto unit (`octeon-aes`, new driver): ~150 MB/s vs 14 MB/s in software | ✅ tested (test vectors, benchmark) |
+| Octeon crypto unit (new drivers): AES ECB/CBC/CTR, GHASH (so AES-GCM runs in hardware), optional 3DES; see [Crypto](#crypto) | ✅ tested (kernel self-tests incl. fuzzing, benchmark) |
+| ChaCha20 assembly on the 64-bit Octeon (used by WireGuard): +40% over generic C | ✅ tested (kernel self-tests incl. fuzzing, benchmark) |
 
 Included packages beyond OpenWrt's defaults: WireGuard, SQM (cake), ksmbd file sharing,
 p910nd printer sharing, USB tethering (Android/iPhone), Wake-on-LAN, Dynamic DNS, full
@@ -59,7 +60,8 @@ official servers work.
 | `patches-6.12/162-dts-dlink-dsr-1000n-switch.patch` | BCM53115 (b53, MDIO address 30) with port labels; `wan2` label |
 | `patches-6.12/163-staging-octeon-accept-length-errors.patch` | Don't drop frames for PIP length errors (Broadcom DSA tags trigger them) |
 | `patches-6.12/164-dts-dlink-dsr-1000n-buttons.patch` | Reset and WPS buttons (gpio-keys-polled) |
-| `patches-6.12/165-crypto-octeon-add-aes.patch` | **New driver:** AES-128/192/256 (block cipher, ECB, CBC) on the Octeon crypto coprocessor. Mainline only uses it for MD5/SHA. Checks FIPS-197 / SP 800-38A test vectors at load and refuses to register if they fail. Used automatically by IPsec, SMB3 encryption, dm-crypt; `modprobe octeon-aes bench=1` prints a benchmark |
+| `patches-6.12/165-crypto-octeon-add-aes.patch` | **New drivers** for the Octeon crypto coprocessor (mainline only uses it for MD5/SHA): `octeon-aes` (AES-128/192/256 block cipher, ECB, CBC, CTR), `octeon-ghash` (GCM's GHASH on the Galois-field multiplier, so `gcm(aes)` runs entirely on the crypto unit) and `octeon-des3` (3DES ECB/CBC, not loaded by default). Each checks itself at load (FIPS-197 / SP 800-38A vectors, cross-checks against the generic code with random data and odd splits) and refuses to register on a mismatch. Used automatically by IPsec, SMB3 encryption, dm-crypt |
+| `patches-6.12/176-crypto-mips-chacha-64bit.patch` | Linux's MIPS32r2 ChaCha assembly ported to the 64-bit n64 ABI and enabled for Octeon (register names, 5th argument in `a4`, 64-bit saves and pointer arithmetic). WireGuard uses it through the ChaCha library |
 | `patches-6.12/166-staging-octeon-rx-fastpath.patch` | Octeon RX fast path (on by default via `octeon-accel`). Hands established flows straight from the driver's receive loop to the firewall's flowtable (needs software flow offloading on), skipping DSA's GRO pass, a second stack pass and the bridge. `echo 1 > /sys/module/octeon_ethernet/parameters/fastpath`; counters `fastpath_hits/misses/seen`. RAM-boot test: all transfers checksum-correct, ~+10% download / ~+40% upload through a test server on the router itself |
 | `patches-6.12/167-staging-octeon-skb-reuse-switch.patch` | **Buffer reuse:** the PKO frees a transmitted buffer straight back into the hardware RX pool instead of an skb free + reallocation per packet. The driver's old code for this was compiled out with netfilter and its size check no longer matched current kernels; fixed, and the skb is reset to a freshly allocated state before reuse. Runtime switch `skb_reuse`, counter `skb_reused` |
 | `patches-6.12/168-lib-string-aligned-word-memcmp.patch` | Generic `memcmp()` compares a word at a time when both buffers are aligned (MIPS otherwise gets a byte loop); the flowtable's key compare was ~6% of CPU |
@@ -71,10 +73,10 @@ official servers work.
 | `files/etc/uci-defaults/93-dsr1000n-wan-eth1` | Moves WAN to `eth1` via `br-wan` (wan + wanlink) on first boot, keeps WAN1's MAC; undo steps in the file |
 | `package/kernel/linux/modules/netdevices.mk` | `kmod-octeon-fwd` package |
 | `package/network/config/firewall4/patches/100-software-offload-on-lower-devices.patch` | fw4 registers the software flowtable on bridge members (`lan1`..`lan4`) instead of `br-lan`, so offloaded flows transmit directly to the port (no bridge, no neighbour lookup) |
-| `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath`, `skb_reuse`, `conduit_noqueue` (no qdisc on `eth0`) and `wqe_fwd` (octeon-fwd) at boot, all on; set an option to `0` and `/etc/init.d/octeon-accel reload` to turn it off |
+| `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath`, `skb_reuse`, `conduit_noqueue` (no qdisc on the Octeon ports) and `wqe_fwd` (octeon-fwd) at boot, all on; set an option to `0` and `/etc/init.d/octeon-accel reload` to turn it off. `des3` (hardware 3DES) is off; set it to `1` only for old VPN peers that need 3DES |
 | `files/etc/uci-defaults/92-dsr1000n-octeon-accel` | Enables the above and software flow offloading on first boot |
 | `files/etc/uci-defaults/91-dsr1000n-wifi-name` | The stock AR9160 card reports Atheros' reference ID 168c:2082, which OpenWrt's tables call "Ubiquiti SR71A" with a +7 dB TX power offset; corrects that entry to "Atheros AR9160", 0 dB, on this board |
-| `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon` package |
+| `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon`, `kmod-crypto-ghash-octeon`, `kmod-crypto-des3-octeon` packages; `kmod-crypto-lib-chacha20` uses the ported ChaCha on Octeon |
 | `image/Makefile` | `Device/dlink_dsr-1000n`: ELF kernel with appended DTB + squashfs, `sysupgrade.bin` |
 | `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core); `CVMSEG_SIZE=2`, no `LOCK_L2` (see Performance) |
 | `base-files/lib/preinit/01_sysinfo` | Board detection from the DT model (U-Boot reports board type 20006, which OpenWrt calls ITUS_SHIELD) |
@@ -154,6 +156,28 @@ Notes:
   [octeon-flowtable](https://github.com/packerlschupfer/octeon-flowtable) (dual-core CN5020,
   separate flow engine); octeon-fwd is a separate implementation that reuses the kernel
   flowtable instead of keeping its own flow state.
+
+### Crypto
+
+The CN5010's crypto coprocessor has units for AES, 3DES, SHA-1/2, MD5 and a Galois-field
+multiplier (GHASH). Mainline only used it for the hashes; patch 165 adds the rest. Kernel
+`tcrypt`, one 500 MHz core, 1420–1424-byte blocks (1 MB/s ≈ 8 Mb/s, crypto only):
+
+| Algorithm | Software | This image | Driver |
+|---|---|---|---|
+| AES-128 ECB | 16.0 MB/s | **131.7 MB/s** | `ecb-aes-octeon` |
+| AES-128 CBC | — | **138.0 MB/s** | `cbc-aes-octeon` |
+| AES-GCM (IPsec `rfc4106`, AES-128) | — | **53.5 MB/s** | `gcm_base(ctr-aes-octeon,ghash-octeon)` |
+| GHASH | 32.1 MB/s | **161.7 MB/s** | `ghash-octeon` |
+| SHA-1 | 18.1 MB/s | **168.5 MB/s** | `octeon-sha1` (mainline driver, now packaged) |
+| 3DES ECB/CBC | 2.9 MB/s | **93.6 MB/s** | `octeon-des3`, only with `option des3 '1'` |
+| ChaCha20 | 33.3 MB/s | **46.7 MB/s** | `chacha20-mips` (patch 176) |
+| ChaCha20-Poly1305 (IPsec `rfc7539esp`) | 23.1 MB/s | **29.1 MB/s** | `chacha20-mips` + `poly1305-mips` |
+
+ChaCha20 and Poly1305 have no hardware unit, and they cannot be translated onto the AES or
+GHASH units (different operations), so they stay on the CPU; patch 176 makes them use the
+existing MIPS assembly instead of C. For a VPN on this router, AES-GCM is the faster choice:
+IPsec/IKEv2 with `aes128gcm16` or `aes256gcm16`. WireGuard always uses ChaCha20-Poly1305.
 
 ## Build
 
