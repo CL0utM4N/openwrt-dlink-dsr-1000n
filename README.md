@@ -28,6 +28,7 @@ replaces it with a current Linux 6.12 kernel, nftables firewall, WPA3 and LuCI o
 | DS1337 battery-backed clock | ✅ |
 | USB 2.0: storage (ext4, FAT, exFAT, NTFS), printer, phone tethering | ✅ drivers in image |
 | CPU usage on the LuCI overview page | ✅ |
+| AES in the Octeon crypto unit (`octeon-aes`, new driver): ~150 MB/s vs 14 MB/s in software | ✅ tested (test vectors, benchmark) |
 
 Included packages beyond OpenWrt's defaults: WireGuard, SQM (cake), ksmbd file sharing,
 p910nd printer sharing, USB tethering (Android/iPhone), Wake-on-LAN, Dynamic DNS, full
@@ -57,6 +58,8 @@ official servers work.
 | `patches-6.12/162-dts-dlink-dsr-1000n-switch.patch` | BCM53115 (b53, MDIO address 30) with port labels; `wan2` label |
 | `patches-6.12/163-staging-octeon-accept-length-errors.patch` | Don't drop frames for PIP length errors (Broadcom DSA tags trigger them) |
 | `patches-6.12/164-dts-dlink-dsr-1000n-buttons.patch` | Reset and WPS buttons (gpio-keys-polled) |
+| `patches-6.12/165-crypto-octeon-add-aes.patch` | **New driver:** AES-128/192/256 (block cipher, ECB, CBC) on the Octeon crypto coprocessor. Mainline only uses it for MD5/SHA. Checks FIPS-197 / SP 800-38A test vectors at load and refuses to register if they fail. Used automatically by IPsec, SMB3 encryption, dm-crypt; `modprobe octeon-aes bench=1` prints a benchmark |
+| `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon` package |
 | `image/Makefile` | `Device/dlink_dsr-1000n`: ELF kernel with appended DTB + squashfs, `sysupgrade.bin` |
 | `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core) |
 | `base-files/lib/preinit/01_sysinfo` | Board detection from the DT model (U-Boot reports board type 20006, which OpenWrt calls ITUS_SHIELD) |
