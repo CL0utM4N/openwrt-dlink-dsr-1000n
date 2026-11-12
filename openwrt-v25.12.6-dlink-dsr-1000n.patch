@@ -251,22 +251,37 @@ index 0000000..2dc3f3a
 +exit 0
 diff --git a/files/etc/uci-defaults/94-dsr1000n-fstab b/files/etc/uci-defaults/94-dsr1000n-fstab
 new file mode 100755
-index 0000000..e6fea28
+index 0000000..42a51ab
 --- /dev/null
 +++ b/files/etc/uci-defaults/94-dsr1000n-fstab
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,32 @@
 +#!/bin/sh
 +# USB storage: mount any USB drive automatically under /mnt/<device> (e.g. for
-+# ksmbd file sharing). Without /etc/config/fstab block-mount mounts nothing, and
-+# the stock default (block detect) leaves unknown drives unmounted. Creates the
-+# config if missing and enables auto-mount, unless mounts are already set up.
++# file sharing). Without /etc/config/fstab block-mount mounts nothing, and the
++# stock default (block detect) leaves unknown drives unmounted. Creates the
++# config if missing and enables auto-mount for USB drives, unless mounts are
++# already set up by hand. The router's own flash partitions are never mounted.
 +
 +command -v block >/dev/null || exit 0
 +[ -f /etc/config/fstab ] || block detect > /etc/config/fstab 2>/dev/null
 +uci -q get fstab.@global[0] >/dev/null || uci -q add fstab global >/dev/null
 +
-+# leave a hand-made configuration alone
-+uci -q show fstab | grep -q "=mount$" && exit 0
++# leave a hand-made configuration alone (mounts for anything but internal flash)
++uci -q show fstab | grep "^fstab\.[^.]*\.device=" | grep -vq "/dev/mtdblock" && exit 0
++uci -q show fstab | grep -q "^fstab\.[^.]*\.\(uuid\|label\|target\)=" && exit 0
++
++# Internal flash (rootfs, overlay, D-Link config) must stay out of /mnt.
++# A disabled entry would be ignored and anon_mount would mount it anyway;
++# an autofs entry is never mounted by 'block mount' or hotplug (no blockd).
++for d in /dev/mtdblock*; do
++	[ -b "$d" ] || continue
++	n=${d#/dev/}
++	uci -q show fstab | grep -q "\.device='/dev/$n'$" && continue
++	s=$(uci add fstab mount)
++	uci set fstab.$s.device="/dev/$n"
++	uci set fstab.$s.enabled='1'
++	uci set fstab.$s.autofs='1'
++done
 +
 +uci set fstab.@global[0].anon_mount='1'
 +uci set fstab.@global[0].auto_mount='1'

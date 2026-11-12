@@ -70,7 +70,7 @@ official servers work.
 | `patches-6.12/172-netfilter-flowtable-export-inet-hook.patch` | Exports `nf_flow_offload_inet_hook` so octeon-fwd can find a port's flowtable |
 | `patches-6.12/177-staging-octeon-fwd-ipv6-encap-sqm-wifi.patch` | octeon-fwd: IPv6, VLAN/PPPoE (also PPPoE over VLAN), skb transmit for Wi-Fi/other outputs and shaped ports, never bypassing SQM; driver fast path leaves ports with tc ingress to the normal path |
 | `patches-6.12/178-netfilter-flowtable-keep-ingress-shaping-on-encap.patch` | Kernel flowtable: packets for a VLAN/PPPoE device with tc ingress (SQM download) take the normal path instead of bypassing the shaper |
-| `files/etc/uci-defaults/94-dsr1000n-fstab` | Auto-mounts USB drives under `/mnt/` (creates `/etc/config/fstab` if missing and turns on mounting of unknown drives, unless mounts are already configured) |
+| `files/etc/uci-defaults/94-dsr1000n-fstab` | Auto-mounts USB drives under `/mnt/` (creates `/etc/config/fstab` if missing and turns on mounting of unknown drives, unless mounts are already configured). The router's own flash partitions get `autofs` entries so they are never mounted: a disabled fstab entry is ignored by block-mount and would not stop that |
 | `files/etc/hotplug.d/net/30-flowtable-wifi` | Adds Wi-Fi interfaces created after the firewall started to the running flowtable |
 | `patches-6.12/173-dts-dlink-dsr-1000n-wanlink.patch` | Switch port 5 (wired to `eth1`) as user port `wanlink`, fixed 1 Gb/s RGMII |
 | `patches-6.12/174-net-dsa-b53-rgmii-on-531x5-port5.patch` | b53: BCM53115 port 5 in `enabled_ports` (it was left out, so the switch dropped frames to it) and RGMII advertised for it |
