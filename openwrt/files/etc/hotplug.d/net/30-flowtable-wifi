@@ -1,0 +1,18 @@
+#!/bin/sh
+# Wi-Fi interfaces (access point, client) are created after the firewall has
+# built its software flowtable, and fw4 only collects flowtable devices on a
+# full reload. Add each new Wi-Fi interface to the running flowtable so its
+# flows are offloaded (the next firewall reload includes it anyway).
+
+[ "$ACTION" = add ] || exit 0
+[ "$DEVTYPE" = wlan ] || exit 0
+dev="${INTERFACE:-$DEVICENAME}"
+[ -n "$dev" ] || exit 0
+[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = 1 ] || exit 0
+
+ft="$(nft list flowtable inet fw4 ft 2>/dev/null)" || exit 0
+case "$ft" in
+*"\"$dev\""*) exit 0 ;;
+esac
+nft add flowtable inet fw4 ft "{ hook ingress priority filter; devices = { \"$dev\" }; }" 2>/dev/null
+exit 0

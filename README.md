@@ -32,7 +32,7 @@ replaces it with a current Linux 6.12 kernel, nftables firewall, WPA3 and LuCI o
 | Octeon crypto unit (new drivers): AES ECB/CBC/CTR, GHASH, one-pass AES-GCM (128.8 MB/s, 2.4x), optional 3DES; see [Crypto](#crypto) | ✅ tested (kernel self-tests incl. fuzzing, benchmark) |
 | ChaCha20 assembly on the 64-bit Octeon (used by WireGuard): +40% over generic C | ✅ tested (kernel self-tests incl. fuzzing, benchmark) |
 
-Included packages beyond OpenWrt's defaults: WireGuard, SQM (cake), ksmbd file sharing,
+Included packages beyond OpenWrt's defaults: WireGuard, IPsec (strongSwan, LuCI), SQM (cake), ksmbd file sharing,
 p910nd printer sharing, USB tethering (Android/iPhone), Wake-on-LAN, Dynamic DNS, full
 `wpad-mbedtls` (WPS push-button). **Every** kernel module is built too
 (`CONFIG_ALL_KMODS=y`): this is a custom kernel, so kernel modules from the official
@@ -68,12 +68,15 @@ official servers work.
 | `patches-6.12/169-staging-octeon-cheaper-tx-bookkeeping.patch` | TX cleanup tasklet scheduled every 1024 packets as the code comment intends (the test was inverted), and no watchdog CSR write when the hardware frees the buffer |
 | `patches-6.12/171-staging-octeon-add-octeon-fwd.patch` | RX hook + `cvm_oct_xmit_fpa_buffer()` in the driver, and the `octeon-fwd` module (see Performance) |
 | `patches-6.12/172-netfilter-flowtable-export-inet-hook.patch` | Exports `nf_flow_offload_inet_hook` so octeon-fwd can find a port's flowtable |
+| `patches-6.12/177-staging-octeon-fwd-ipv6-encap-sqm-wifi.patch` | octeon-fwd: IPv6, VLAN/PPPoE (also PPPoE over VLAN), skb transmit for Wi-Fi/other outputs and shaped ports, never bypassing SQM; driver fast path leaves ports with tc ingress to the normal path |
+| `patches-6.12/178-netfilter-flowtable-keep-ingress-shaping-on-encap.patch` | Kernel flowtable: packets for a VLAN/PPPoE device with tc ingress (SQM download) take the normal path instead of bypassing the shaper |
+| `files/etc/hotplug.d/net/30-flowtable-wifi` | Adds Wi-Fi interfaces created after the firewall started to the running flowtable |
 | `patches-6.12/173-dts-dlink-dsr-1000n-wanlink.patch` | Switch port 5 (wired to `eth1`) as user port `wanlink`, fixed 1 Gb/s RGMII |
 | `patches-6.12/174-net-dsa-b53-rgmii-on-531x5-port5.patch` | b53: BCM53115 port 5 in `enabled_ports` (it was left out, so the switch dropped frames to it) and RGMII advertised for it |
 | `files/etc/uci-defaults/93-dsr1000n-wan-eth1` | Moves WAN to `eth1` via `br-wan` (wan + wanlink) on first boot, keeps WAN1's MAC; undo steps in the file |
 | `package/kernel/linux/modules/netdevices.mk` | `kmod-octeon-fwd` package |
 | `package/network/config/firewall4/patches/100-software-offload-on-lower-devices.patch` | fw4 registers the software flowtable on bridge members (`lan1`..`lan4`) instead of `br-lan`, so offloaded flows transmit directly to the port (no bridge, no neighbour lookup) |
-| `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath`, `skb_reuse`, `conduit_noqueue` (no qdisc on the Octeon ports) and `wqe_fwd` (octeon-fwd) at boot, all on; set an option to `0` and `/etc/init.d/octeon-accel reload` to turn it off. `des3` (hardware 3DES) is off; set it to `1` only for old VPN peers that need 3DES |
+| `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath`, `skb_reuse`, `conduit_noqueue` (no qdisc on the Octeon ports; shapers such as SQM are left alone) and `wqe_fwd` (octeon-fwd) at boot, all on; set an option to `0` and `/etc/init.d/octeon-accel reload` to turn it off. `des3` (hardware 3DES) is off; set it to `1` only for old VPN peers that need 3DES |
 | `files/etc/uci-defaults/92-dsr1000n-octeon-accel` | Enables the above and software flow offloading on first boot |
 | `files/etc/uci-defaults/91-dsr1000n-wifi-name` | The stock AR9160 card reports Atheros' reference ID 168c:2082, which OpenWrt's tables call "Ubiquiti SR71A" with a +7 dB TX power offset; corrects that entry to "Atheros AR9160", 0 dB, on this board |
 | `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon`, `kmod-crypto-ghash-octeon`, `kmod-crypto-gcm-octeon`, `kmod-crypto-des3-octeon` packages; `kmod-crypto-lib-chacha20` uses the ported ChaCha on Octeon |
@@ -133,15 +136,63 @@ WAN2 (`eth2`) already has its own link; octeon-fwd covers it too.
 
 `kmod-octeon-fwd` hooks the octeon-ethernet RX loop before the network stack. For packets from
 the Broadcom-tagged switch or a plain Octeon port (`eth1`, `wan2`) it looks the flow up in the
-**kernel's own flowtable** (the one fw4 registers on the ports), applies the flowtable's
-NAT/TTL/MAC rewrite in place, adds, keeps or removes the Broadcom tag for the output port (MAC from
-the flow for bridge/DSA paths, from the confirmed neighbour entry for routed ones) and hands the
-same FPA buffer to the PKO, which frees it back into the RX pool. No skb processing, network stack, DSA, bridge or qdisc per packet. Policy, flow setup,
-timeouts and counters stay netfilter's; anything not matched (new connections, non-IPv4, IP
-options, fragments, TCP FIN/RST, MTU, non-direct paths, Wi-Fi) takes the normal path unchanged.
-Counters: `/sys/module/octeon_fwd/parameters/{hits,misses,passed}`; off switch `enable`, or
-`option wqe_fwd '0'` in `/etc/config/octeon_accel`. Tested: checksum-verified TCP, unload and
-reload under a 218 kpps flood, live on/off, no leaks.
+**kernel's own flowtable** (the one fw4 registers on the ports) and applies the flowtable's
+NAT/TTL/MAC rewrite in place. Then:
+
+* **Octeon output port:** it adds, keeps or removes the Broadcom tag, VLAN and PPPoE headers for
+  the output (MAC from the flow for bridge/DSA/VLAN/PPPoE paths, from the confirmed neighbour
+  entry for routed ones) and hands the same FPA buffer to the PKO, which frees it back into the
+  RX pool. No skb processing, network stack, DSA, bridge or qdisc per packet.
+* **Any other output** (Wi-Fi, other drivers) **or a port with a shaper** (SQM): the rewritten
+  packet goes to `dev_queue_xmit()` as an skb, exactly as the flowtable would send it, without
+  the second lookup.
+
+Covers IPv4 and IPv6 (TCP/UDP), plain, VLAN (802.1Q/802.1ad), PPPoE and PPPoE over VLAN WANs;
+VLAN/PPP interface counters are kept. Policy, flow setup, timeouts and counters stay netfilter's;
+anything not matched (new connections, other protocols, IP options, IPv6 extension headers,
+fragments, TCP FIN/RST, MTU, IPv6 NAT, IPsec, bridge VLANs) takes the normal path unchanged.
+Counters: `/sys/module/octeon_fwd/parameters/{hits,skb_hits,misses,passed}`; off switch
+`enable`, or `option wqe_fwd '0'` in `/etc/config/octeon_accel`. Tested: checksum-verified TCP,
+unload and reload under a 218 kpps flood, live on/off, no leaks; checked transfers over every
+WAN type below.
+
+WAN types, tested against a test ISP on switch port 5 (wired inside the box to `eth1`) with
+checked 24 MB downloads / 16 MB uploads (MD5 compared); the test ISP runs on the router's own
+CPU, so the speeds compare modes rather than show the maximum:
+
+| WAN | octeon-fwd path | Download / upload | octeon-fwd off | SQM 20/10 Mb/s |
+|---|---|---|---|---|
+| Plain (`eth1`), IPv4 | PKO both ways | 80 / 37 Mb/s ✅ | 74 / 36 | 19 / 9 ✅ |
+| Plain, IPv6 | PKO both ways | 76 / 37 Mb/s ✅ | — | — |
+| VLAN (`eth1.10`), IPv4 | PKO both ways | 72 / 36 Mb/s ✅ | 60 / 36 | 19 / 9 ✅ |
+| VLAN, IPv6 | PKO both ways | 66 / 36 Mb/s ✅ | — | — |
+| PPPoE | PKO down, skb up | 59 / 36 Mb/s ✅ | 54 / 35 | 19 / 9 ✅ |
+| PPPoE over VLAN | PKO down, skb up | 57 / 35 Mb/s ✅ | 51 / 35 | 19 / 9 ✅ |
+| Wi-Fi client uplink | skb (LAN → Wi-Fi) | 130–168 / 52 Mb/s (internet) | 129 / 53 | — |
+
+PPPoE over VLAN is offloaded by octeon-fwd only: the kernel flowtable can pop just one in-band
+encapsulation.
+
+### SQM
+
+SQM (cake) can go on any WAN or LAN device and shapes every packet in both directions:
+octeon-fwd sends packets for a shaped output through the qdisc and leaves ports with ingress
+shaping to the normal path, the driver fast path does the same, `octeon-accel` leaves shapers in
+place, and patch 178 stops the kernel flowtable from bypassing download shaping on a VLAN or PPPoE
+device (`eth1.N`, `pppoe-wan`), which plain OpenWrt also does. Shaping costs speed: a shaped
+port uses the normal transmit path.
+
+### IPsec VPN
+
+strongSwan (IKEv2, swanctl) with its LuCI app (`luci-app-strongswan-swanctl`), kernel IPsec and
+certificate tools (`pki`) are included; no tunnel is preconfigured. ESP uses the crypto unit:
+`seqiv(rfc4106-gcm-aes-octeon)` for AES-GCM, `authenc(hmac(octeon-sha256),cbc-aes-octeon)` for
+AES-CBC + SHA-256. Use `aes128gcm16` or `aes256gcm16`. Plugins: OpenSSL (IKE crypto), x509,
+PSK, EAP-MSCHAPv2 and EAP identity (username/password for phone and Windows clients), attr and
+resolve (DNS for clients). Tested: IKEv2 PSK tunnel from a Linux client behind NAT
+(ESP-in-UDP), checked transfers for AES-128/256-GCM and AES-CBC/SHA-256. In that test the router
+was also the TCP end point and web server, so it measured ~20–27 Mb/s whatever the cipher; that
+test does not show the VPN's forwarding speed.
 
 Notes:
 * Full-size forwarding is limited by the gigabit link, not the CPU; small packets are CPU bound
@@ -189,9 +240,9 @@ IPsec/IKEv2 with `aes128gcm16` or `aes256gcm16`. WireGuard always uses ChaCha20-
 
 U-Boot boots the kernel as a plain ELF (no compressed-kernel support for Octeon), so every
 kilobyte built into the kernel costs a kilobyte of flash, while modules sit compressed in
-squashfs. Of the 29 MB firmware partition the image uses **17.0 MB** (kernel 8.0 MB, rootfs
-8.2 MB), leaving **~12.7 MB** for settings and extra packages. Trims that took 2.2 MB off
-with no change in forwarding, TCP or crypto speed (A/B measured):
+squashfs. Of the 29 MB firmware partition the image uses **18.7 MB** (kernel 8.0 MB, rootfs
+with strongSwan 9.9 MB), leaving **~11 MB** for settings and extra packages. Trims that took
+2.2 MB off with no change in forwarding, TCP or crypto speed (A/B measured):
 
 | Trim | Kernel saving |
 |---|---|

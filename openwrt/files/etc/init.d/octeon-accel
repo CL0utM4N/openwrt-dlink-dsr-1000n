@@ -4,8 +4,9 @@
 #                     loop (needs Network -> Firewall -> Software flow offloading)
 #   skb_reuse       - return transmitted buffers directly to the hardware RX pool
 #   conduit_noqueue - no qdisc on the Octeon ports (eth0 = DSA conduit, eth1,
-#                     eth2). Put SQM/cake on the WAN device if wanted; it
-#                     replaces this.
+#                     eth2). SQM/cake can go on any device: shapers are left
+#                     alone here, and octeon-fwd and the fast path step aside
+#                     for shaped ports so SQM sees every packet.
 #   wqe_fwd         - octeon-fwd: forward offloaded flows straight from the RX
 #                     hardware buffer (kmod-octeon-fwd)
 #   des3            - hardware Triple DES (kmod-crypto-des3-octeon). 3DES is
@@ -42,6 +43,12 @@ apply() {
 		case "$(readlink /sys/class/net/$dev/device/driver 2>/dev/null)" in
 		*/octeon_ethernet) ;;
 		*) [ -d "/sys/class/net/$dev/dsa" ] || continue ;;
+		esac
+		# leave shapers alone (SQM's cake/htb/hfsc, anything set by hand):
+		# only the default qdiscs are swapped for noqueue or restored
+		case "$(tc qdisc show dev "$dev" root 2>/dev/null | awk '{ print $2; exit }')" in
+		""|noqueue|fq_codel|pfifo_fast|mq) ;;
+		*) continue ;;
 		esac
 		if [ "$noqueue" = 1 ]; then
 			tc qdisc replace dev "$dev" root noqueue 2>/dev/null

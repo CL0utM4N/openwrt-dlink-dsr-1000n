@@ -1,0 +1,871 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] staging: octeon: octeon-fwd: IPv6, VLAN/PPPoE, shaper-aware, skb transmit
+
+- IPv6 (TCP/UDP, no extension headers) next to IPv4.
+- VLAN (802.1Q/802.1ad), PPPoE and PPPoE over VLAN: headers popped on
+  receive and pushed on transmit; the output VLAN/PPP device is followed
+  down to its port with dev_fill_forward_path(), as the flowtable does.
+  Counters of the VLAN/PPP devices are kept.
+- Never bypass shaping: packets on a port with tc ingress (SQM download
+  side) take the normal path; a shaping qdisc on any output device sends
+  the packet through dev_queue_xmit() instead of straight to the PKO.
+- Outputs that are not Octeon ports (Wi-Fi, other drivers) get the
+  rewritten packet as an skb through dev_queue_xmit() (new hook result
+  CVM_OCT_RX_STOLEN), saving the second lookup in the flowtable.
+- Driver fast path: ports with tc ingress keep the normal path, so
+  nf_hook_ingress() no longer runs ahead of SQM's ingress shaping.
+diff -Nurp a/drivers/staging/octeon/ethernet-rx.c b/drivers/staging/octeon/ethernet-rx.c
+--- a/drivers/staging/octeon/ethernet-rx.c	2026-11-12 12:57:06.245311543 +1100
++++ b/drivers/staging/octeon/ethernet-rx.c	2026-11-12 12:57:28.517225847 +1100
+@@ -202,6 +202,16 @@ module_param(fastpath_misses, ulong, 044
+ static unsigned long fastpath_seen;
+ module_param(fastpath_seen, ulong, 0444);
+ 
++/* tc ingress (ingress/clsact qdisc, e.g. SQM's download shaping) on @dev */
++static inline bool cvm_oct_tc_ingress(const struct net_device *dev)
++{
++#ifdef CONFIG_NET_XGRESS
++	return rcu_access_pointer(dev->tcx_ingress);
++#else
++	return false;
++#endif
++}
++
+ /* Returns true if the skb was consumed (forwarded, delivered or freed). */
+ static bool cvm_oct_fastpath_rx(struct sk_buff *skb)
+ {
+@@ -209,6 +219,13 @@ static bool cvm_oct_fastpath_rx(struct s
+ 	struct sk_buff *nskb;
+ 	int ret;
+ 
++	/*
++	 * nf_hook_ingress() below runs before tc ingress would: a port with
++	 * ingress shaping keeps the normal path so the shaper sees everything.
++	 */
++	if (cvm_oct_tc_ingress(dev))
++		return false;
++
+ 	if (netdev_uses_dsa(dev)) {
+ 		struct dsa_port *cpu_dp = dev->dsa_ptr;
+ 		__be16 etype;
+@@ -268,6 +285,9 @@ static bool cvm_oct_fastpath_rx(struct s
+ 		if (!rcu_access_pointer(user->nf_hooks_ingress))
+ 			target = upper;
+ 	}
++	if (cvm_oct_tc_ingress(user) ||
++	    (target != user && cvm_oct_tc_ingress(target)))
++		goto slow;
+ 	if (!ether_addr_equal(eth_hdr(skb)->h_dest, upper->dev_addr))
+ 		goto slow;
+ 
+@@ -477,6 +497,8 @@ static int cvm_oct_poll(struct oct_rx_gr
+ 						cvm_oct_free_work(work);
+ 						continue;
+ 					}
++					if (r == CVM_OCT_RX_STOLEN)
++						goto rx_done;	/* skb owned by the hook */
+ 				}
+ 				skb->protocol = eth_type_trans(skb, dev);
+ 				skb->dev = dev;
+@@ -516,6 +538,7 @@ static int cvm_oct_poll(struct oct_rx_gr
+ 					   port);
+ 			dev_kfree_skb_irq(skb);
+ 		}
++rx_done:
+ 		/*
+ 		 * Check to see if the skbuff and work share the same
+ 		 * packet buffer.
+diff -Nurp a/drivers/staging/octeon/octeon-ethernet.h b/drivers/staging/octeon/octeon-ethernet.h
+--- a/drivers/staging/octeon/octeon-ethernet.h	2026-11-12 12:57:06.244960838 +1100
++++ b/drivers/staging/octeon/octeon-ethernet.h	2026-11-12 12:57:28.516768952 +1100
+@@ -94,9 +94,10 @@ int cvm_oct_free_work(void *work_queue_e
+  * Optional receive hook for a hardware-buffer forwarding engine (octeon-fwd).
+  * Called from the NAPI loop for zero-copy packets, before the stack sees them.
+  * Returns CVM_OCT_RX_PASS to continue normally, CVM_OCT_RX_SENT if the packet
+- * buffer was handed to the PKO (hardware frees it), CVM_OCT_RX_DROP to drop.
++ * buffer was handed to the PKO (hardware frees it), CVM_OCT_RX_DROP to drop,
++ * CVM_OCT_RX_STOLEN if the hook consumed the skb (e.g. dev_queue_xmit()).
+  */
+-enum { CVM_OCT_RX_PASS, CVM_OCT_RX_SENT, CVM_OCT_RX_DROP };
++enum { CVM_OCT_RX_PASS, CVM_OCT_RX_SENT, CVM_OCT_RX_DROP, CVM_OCT_RX_STOLEN };
+ typedef int (*cvm_oct_rx_hook_t)(struct net_device *dev, struct cvmx_wqe *work,
+ 				 struct sk_buff *skb);
+ int cvm_oct_set_rx_hook(cvm_oct_rx_hook_t hook);
+diff -Nurp a/drivers/staging/octeon/octeon-fwd.c b/drivers/staging/octeon/octeon-fwd.c
+--- a/drivers/staging/octeon/octeon-fwd.c	2026-11-12 12:57:06.243758389 +1100
++++ b/drivers/staging/octeon/octeon-fwd.c	2026-11-12 14:48:41.571030715 +1100
+@@ -6,23 +6,36 @@
+  *
+  * For every zero-copy packet the octeon-ethernet RX loop receives, this
+  * module looks the flow up in the netfilter flowtable registered on the
+- * ingress switch port (software flow offloading, fw4 on lower devices), and
+- * on a hit rewrites the packet in place (NAT, TTL, MACs, Broadcom egress tag)
+- * and hands the same FPA buffer to the PKO, which frees it back into the
+- * receive pool. No skb processing, no network stack, no DSA/bridge layers.
++ * ingress port (software flow offloading, fw4 on lower devices). On a hit:
+  *
+- * Flow state is the kernel's own: which connections are offloaded is still
+- * decided by netfilter, and timeouts, NAT and counters follow the flowtable's
+- * own rules (same checks as nf_flow_offload_ip_hook()). Everything else
+- * (misses, non-IPv4, options, fragments, TCP FIN/RST, MTU, non-direct
+- * transmit paths) passes through unchanged to the normal receive path.
++ *  - Octeon output port, no queueing discipline in the way: the packet is
++ *    rewritten in place (NAT, TTL/hop limit, MACs, Broadcom tag, VLAN and
++ *    PPPoE headers) and the same FPA buffer goes to the PKO, which frees it
++ *    back into the receive pool. No skb processing, stack, DSA or bridge.
++ *  - Any other output (Wi-Fi, other drivers) or a port with a shaper such as
++ *    SQM/cake: the packet is rewritten the same way and handed to
++ *    dev_queue_xmit() as an skb, so qdiscs and other drivers see it exactly
++ *    as from the flowtable's own transmit path, minus the second lookup.
++ *
++ * IPv4 and IPv6 (TCP/UDP), plain, VLAN (802.1Q/802.1ad), PPPoE and PPPoE
++ * over VLAN. Flow state is the kernel's own: which connections are offloaded
++ * is still decided by netfilter, and timeouts, NAT and counters follow the
++ * flowtable's own rules (same checks as nf_flow_offload_ip(v6)_hook()).
++ * Packets on a port with ingress shaping (tc ingress, e.g. SQM's download
++ * side) are never taken. Everything else (misses, other protocols, options,
++ * extension headers, fragments, TCP FIN/RST, MTU, IPv6 NAT, IPsec, bridge
++ * VLANs) passes through unchanged to the normal receive path.
+  */
+ 
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_bridge.h>
++#include <linux/if_vlan.h>
++#include <linux/if_pppox.h>
+ #include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/ppp_defs.h>
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
+ #include <linux/netfilter.h>
+@@ -30,9 +43,12 @@
+ #include <net/arp.h>
+ #include <net/dsa.h>
+ #include <net/ip.h>
++#include <net/ip6_route.h>
++#include <net/ndisc.h>
+ #include <net/neighbour.h>
+ #include <net/route.h>
+ #include <net/checksum.h>
++#include <net/sch_generic.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
+ 
+@@ -44,19 +60,24 @@ MODULE_PARM_DESC(enable, "Forward offloa
+ 
+ static unsigned long hits;
+ module_param(hits, ulong, 0444);
++MODULE_PARM_DESC(hits, "Packets forwarded straight to the PKO");
++static unsigned long skb_hits;
++module_param(skb_hits, ulong, 0444);
++MODULE_PARM_DESC(skb_hits, "Packets forwarded through dev_queue_xmit (Wi-Fi, shaped ports)");
+ static unsigned long misses;
+ module_param(misses, ulong, 0444);
+ static unsigned long passed;
+ module_param(passed, ulong, 0444);
+ 
+ #define BRCM_TAG_LEN		4
+-#define BRCM_ETH_HLEN		(2 * ETH_ALEN + BRCM_TAG_LEN + 2)	/* 18 */
+ #define BRCM_OPCODE_SHIFT	5
+ #define BRCM_OPCODE_MASK	0x7
+ #define BRCM_EG_RC_RSVD		(3 << 6)
+ #define BRCM_EG_PID_MASK	0x1f
+ #define BRCM_IG_DSTMAP1_MASK	0xff
+ 
++#define FWD_ENCAP_MAX		NF_FLOW_TABLE_ENCAP_MAX	/* 2 */
++
+ /*
+  * Per-packet device resolution is cached; any netdev change flushes the
+  * caches (netdevice notifier). Entries are plain pointers read under RCU:
+@@ -68,12 +89,22 @@ struct fwd_in_ent {
+ };
+ static struct fwd_in_ent fwd_in_cache[32];
+ 
++struct fwd_encap {
++	__be16 proto;			/* ETH_P_8021Q/8021AD or ETH_P_PPP_SES */
++	u16 id;				/* VLAN TCI (VID + egress priority) or PPPoE session */
++	struct net_device *dev;		/* the VLAN or PPP netdev, for its counters */
++};
++
+ struct fwd_out_ent {
+ 	int ifindex;
+-	struct net_device *dev;		/* output netdev */
++	struct net_device *dev;		/* output netdev from the flow (may be VLAN/PPP) */
++	struct net_device *real;	/* Octeon or DSA user port below it */
+ 	struct net_device *txdev;	/* Octeon port that transmits */
+ 	u8 tagged;			/* needs a Broadcom tag */
+ 	u8 port;			/* switch port, if tagged */
++	u8 skb_xmit;			/* not an Octeon path: use dev_queue_xmit(dev) */
++	u8 n_encap;
++	struct fwd_encap encap[FWD_ENCAP_MAX];	/* wire order, outermost first */
+ };
+ #define FWD_OUT_SLOTS 16
+ static struct fwd_out_ent fwd_out_cache[FWD_OUT_SLOTS];
+@@ -99,6 +130,7 @@ static int fwd_netdev_event(struct notif
+ 	case NETDEV_CHANGENAME:
+ 	case NETDEV_CHANGEADDR:
+ 	case NETDEV_CHANGEUPPER:
++	case NETDEV_CHANGELOWERSTATE:
+ 		fwd_cache_flush();
+ 		break;
+ 	}
+@@ -109,6 +141,30 @@ static struct notifier_block fwd_netdev_
+ 	.notifier_call = fwd_netdev_event,
+ };
+ 
++/* Ingress shaping (tc ingress / clsact, e.g. SQM via ifb) on this device. */
++static inline bool fwd_rx_tc(const struct net_device *dev)
++{
++#ifdef CONFIG_NET_XGRESS
++	return rcu_access_pointer(dev->tcx_ingress);
++#else
++	return false;
++#endif
++}
++
++/*
++ * A queueing discipline that changes what goes out (shaper, scheduler) on
++ * this device's transmit queue. noqueue, pfifo_fast and the default qdisc
++ * (fq_codel) only queue under backpressure and are bypassed like the PKO
++ * path always did.
++ */
++static inline bool fwd_tx_shaped(const struct net_device *dev)
++{
++	const struct Qdisc *q = rcu_dereference(netdev_get_tx_queue(dev, 0)->qdisc);
++
++	return q && q->enqueue && q->ops != default_qdisc_ops &&
++	       q->ops != &pfifo_fast_ops;
++}
++
+ static const struct fwd_in_ent *fwd_in_port(struct net_device *conduit,
+ 					     int port)
+ {
+@@ -141,43 +197,112 @@ static const struct fwd_in_ent *fwd_in_p
+ 	return e;
+ }
+ 
+-/* Resolve how to transmit on @out; @rx is the receiving Octeon port. */
++/*
++ * Resolve how to transmit on @out (as the flowtable names it); @rx is the
++ * receiving Octeon port. VLAN and PPP(oE) devices are followed down to the
++ * port they run on with dev_fill_forward_path(), the same walk the
++ * flowtable did when it offloaded the flow, and their headers recorded.
++ */
+ static const struct fwd_out_ent *fwd_out_dev(struct net_device *rx,
+ 					     struct net_device *out)
+ {
+ 	/* power-of-two mask: a signed % would be a hardware divide per packet */
+ 	struct fwd_out_ent *e =
+ 		&fwd_out_cache[(unsigned int)out->ifindex & (FWD_OUT_SLOTS - 1)];
+-	struct net_device *txdev;
++	struct fwd_out_ent t = {};
++	struct net_device *real = out;
+ 	struct dsa_port *odp;
+-	u8 tagged = 0, port = 0;
++	int i;
+ 
+ 	if (likely(READ_ONCE(e->dev) == out && e->ifindex == out->ifindex))
+ 		return e;
+-	if (dsa_user_dev_check(out)) {
+-		odp = dsa_port_from_netdev(out);
++
++	if (is_vlan_dev(out) || out->type == ARPHRD_PPP) {
++		static const u8 zero_mac[ETH_ALEN];
++		struct net_device_path_stack stack;
++		struct fwd_encap path_enc[FWD_ENCAP_MAX];
++		int n = 0;
++
++		real = NULL;
++		if (dev_fill_forward_path(out, zero_mac, &stack) < 0)
++			goto skb_path;
++		for (i = 0; i < stack.num_paths && !real; i++) {
++			const struct net_device_path *p = &stack.path[i];
++
++			switch (p->type) {
++			case DEV_PATH_VLAN:
++			case DEV_PATH_PPPOE:
++				if (n >= FWD_ENCAP_MAX)
++					goto skb_path;
++				path_enc[n].proto = p->encap.proto;
++				path_enc[n].id = p->encap.id;
++				path_enc[n].dev = (struct net_device *)p->dev;
++				if (p->type == DEV_PATH_VLAN)
++					path_enc[n].id |= vlan_dev_get_egress_qos_mask(
++						(struct net_device *)p->dev, 0);
++				n++;
++				break;
++			case DEV_PATH_ETHERNET:
++			case DEV_PATH_DSA:
++				real = (struct net_device *)p->dev;
++				break;
++			default:	/* bridges, MTK WDMA, ... */
++				goto skb_path;
++			}
++		}
++		if (!real)
++			goto skb_path;
++		/* PPPoE must be innermost on the wire */
++		for (i = 0; i < n; i++)
++			if (path_enc[i].proto == htons(ETH_P_PPP_SES) && i != 0)
++				goto skb_path;
++		/* path order is upper to lower = innermost first; store wire order */
++		for (i = 0; i < n; i++)
++			t.encap[i] = path_enc[n - 1 - i];
++		t.n_encap = n;
++	}
++
++	if (dsa_user_dev_check(real)) {
++		odp = dsa_port_from_netdev(real);
+ 		if (IS_ERR(odp) || odp->ds->index != 0 || odp->index > 7)
+-			return NULL;
+-		txdev = odp->cpu_dp->conduit;
+-		tagged = 1;
+-		port = odp->index;
++			goto skb_path;
++		t.txdev = odp->cpu_dp->conduit;
++		t.tagged = 1;
++		t.port = odp->index;
+ 	} else {
+-		txdev = out;
++		t.txdev = real;
+ 	}
+ 	/* both ends must be Octeon ports driven by octeon-ethernet */
+-	if (txdev->netdev_ops != rx->netdev_ops ||
+-	    !!netdev_uses_dsa(txdev) != !!tagged)
+-		return NULL;
++	if (t.txdev->netdev_ops != rx->netdev_ops ||
++	    !!netdev_uses_dsa(t.txdev) != !!t.tagged)
++		goto skb_path;
++	t.real = real;
++	goto store;
++
++skb_path:
++	memset(&t, 0, sizeof(t));
++	t.skb_xmit = 1;
++store:
++	t.ifindex = out->ifindex;
+ 	spin_lock(&fwd_cache_lock);
+-	e->ifindex = out->ifindex;
+-	e->txdev = txdev;
+-	e->tagged = tagged;
+-	e->port = port;
++	t.dev = NULL;
++	*e = t;
+ 	WRITE_ONCE(e->dev, out);
+ 	spin_unlock(&fwd_cache_lock);
+ 	return e;
+ }
+ 
++static struct net_device *fwd_dev_by_index(struct net *net, int ifindex)
++{
++	const struct fwd_out_ent *hint =
++		&fwd_out_cache[(unsigned int)ifindex & (FWD_OUT_SLOTS - 1)];
++	struct net_device *d = READ_ONCE(hint->dev);
++
++	if (d && hint->ifindex == ifindex)
++		return d;
++	return dev_get_by_index_rcu(net, ifindex);
++}
++
+ static struct nf_flowtable *fwd_flowtable(const struct net_device *dev)
+ {
+ 	const struct nf_hook_entries *e = rcu_dereference(dev->nf_hooks_ingress);
+@@ -191,17 +316,40 @@ static struct nf_flowtable *fwd_flowtabl
+ 	return NULL;
+ }
+ 
++static void fwd_upper_stats(struct net_device *d, unsigned int len, bool rx)
++{
++	if (is_vlan_dev(d)) {
++		struct vlan_pcpu_stats *s =
++			this_cpu_ptr(vlan_dev_priv(d)->vlan_pcpu_stats);
++
++		u64_stats_update_begin(&s->syncp);
++		if (rx) {
++			u64_stats_inc(&s->rx_packets);
++			u64_stats_add(&s->rx_bytes, len);
++		} else {
++			u64_stats_inc(&s->tx_packets);
++			u64_stats_add(&s->tx_bytes, len);
++		}
++		u64_stats_update_end(&s->syncp);
++	} else if (d->pcpu_stat_type == NETDEV_PCPU_STAT_TSTATS) {
++		if (rx)
++			dev_sw_netstats_rx_add(d, len);
++		else
++			dev_sw_netstats_tx_add(d, 1, len);
++	}
++}
++
+ static inline __wsum fwd_csum_swap(__wsum sum, __be32 from, __be32 to)
+ {
+ 	return csum_add(csum_sub(sum, (__force __wsum)from), (__force __wsum)to);
+ }
+ 
+ /*
+- * NAT for one packet, as nf_flow_snat_port/ip + nf_flow_dnat_port/ip do,
+- * but with all address and port changes folded into one incremental update
+- * of the IP and L4 checksums (RFC 1624). SNAT and DNAT touch disjoint fields
+- * (source vs destination), so the result is identical to applying them in
+- * sequence.
++ * NAT for one IPv4 packet, as nf_flow_snat_port/ip + nf_flow_dnat_port/ip
++ * do, but with all address and port changes folded into one incremental
++ * update of the IP and L4 checksums (RFC 1624). SNAT and DNAT touch disjoint
++ * fields (source vs destination), so the result is identical to applying
++ * them in sequence.
+  */
+ static void fwd_nat(const struct flow_offload *flow, struct iphdr *iph,
+ 		    enum flow_offload_tuple_dir dir)
+@@ -268,34 +416,36 @@ static int fwd_rx(struct net_device *dev
+ 	struct flow_offload_tuple tuple = {};
+ 	struct flow_offload_tuple_rhash *th;
+ 	enum flow_offload_tuple_dir dir;
+-	struct net_device *in, *upper, *out, *txdev;
++	struct net_device *in, *upper, *out;
+ 	struct flow_offload *flow;
+ 	struct nf_flowtable *ft;
+ 	struct flow_ports *ports;
+ 	const struct fwd_in_ent *ie;
+-	const struct fwd_out_ent *oe;
+-	unsigned int len = skb->len, tot, l2, newlen;
+-	bool in_tagged, out_tagged;
++	const struct fwd_out_ent *oe, *lie = NULL;
++	struct fwd_encap wire[FWD_ENCAP_MAX];
++	unsigned int len = skb->len, tot, p, l2out, newlen, n_enc = 0, i;
++	unsigned int pppoe_len = 0, l4min, min;
++	bool in_tagged, out_tagged, v6, use_skb;
+ 	union cvmx_buf_ptr buf;
+ 	u64 base, addr;
+-	struct iphdr *iph;
+-	u8 *d = skb->data, *nd;
++	u8 *d = skb->data, *l3, *nd, *w;
+ 	const u8 *dmac, *smac;
+ 	u8 nh_mac[ETH_ALEN];
++	__be16 et;
++	u8 l4proto;
+ 
+ 	if (!READ_ONCE(enable))
+ 		return CVM_OCT_RX_PASS;
+ 
+ 	in_tagged = netdev_uses_dsa(dev);
+-	l2 = in_tagged ? BRCM_ETH_HLEN : ETH_HLEN;
+-	if (len < l2 + sizeof(struct iphdr) + sizeof(struct udphdr))
++	p = 2 * ETH_ALEN + (in_tagged ? BRCM_TAG_LEN : 0);	/* EtherType */
++	if (len < p + 2 + sizeof(struct iphdr) + sizeof(struct udphdr))
+ 		goto pass;
+ 
+ 	if (in_tagged) {
+-		/* Broadcom tag, switch -> CPU: opcode 0, then the EtherType */
++		/* Broadcom tag, switch -> CPU: opcode 0 */
+ 		if (((d[12] >> BRCM_OPCODE_SHIFT) & BRCM_OPCODE_MASK) ||
+-		    (d[14] & BRCM_EG_RC_RSVD) ||
+-		    get_unaligned((__be16 *)(d + 16)) != htons(ETH_P_IP))
++		    (d[14] & BRCM_EG_RC_RSVD))
+ 			goto pass;
+ 		ie = fwd_in_port(dev, d[15] & BRCM_EG_PID_MASK);
+ 		if (!ie)
+@@ -304,43 +454,107 @@ static int fwd_rx(struct net_device *dev
+ 		upper = ie->upper;
+ 	} else {
+ 		/* plain Octeon port, e.g. eth1 behind switch port 5 */
+-		if (get_unaligned((__be16 *)(d + 12)) != htons(ETH_P_IP))
+-			goto pass;
+ 		in = dev;
+ 		upper = dev;
+ 	}
+-	if (!(in->flags & IFF_UP))
+-		goto pass;
+ 
+-	iph = (struct iphdr *)(d + l2);
+-	if (iph->version != 4 || iph->ihl != 5 || ip_is_fragment(iph) ||
+-	    iph->ttl <= 1 ||
+-	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
+-		goto pass;
+-	tot = ntohs(iph->tot_len);
+-	if (tot + l2 > len ||
+-	    tot < sizeof(*iph) + (iph->protocol == IPPROTO_TCP ?
+-				  sizeof(struct tcphdr) : sizeof(struct udphdr)))
++	/* L2 encapsulation: one VLAN tag, then optionally a PPPoE session */
++	et = get_unaligned((__be16 *)(d + p));
++	p += 2;
++	if (et == htons(ETH_P_8021Q) || et == htons(ETH_P_8021AD)) {
++		if (len < p + VLAN_HLEN + sizeof(struct iphdr))
++			goto pass;
++		wire[n_enc].proto = et;
++		wire[n_enc].id = get_unaligned_be16(d + p) & VLAN_VID_MASK;
++		n_enc++;
++		et = get_unaligned((__be16 *)(d + p + 2));
++		p += VLAN_HLEN;
++	}
++	if (et == htons(ETH_P_PPP_SES)) {
++		const u8 *ph = d + p;
++		u16 ppp;
++
++		if (len < p + PPPOE_SES_HLEN + sizeof(struct iphdr) ||
++		    ph[0] != 0x11 || ph[1] != 0)	/* ver 1, type 1, session data */
++			goto pass;
++		wire[n_enc].proto = et;
++		wire[n_enc].id = get_unaligned_be16(ph + 2);
++		n_enc++;
++		pppoe_len = get_unaligned_be16(ph + 4);
++		ppp = get_unaligned_be16(ph + 6);
++		if (ppp == PPP_IP)
++			et = htons(ETH_P_IP);
++		else if (ppp == PPP_IPV6)
++			et = htons(ETH_P_IPV6);
++		else
++			goto pass;
++		p += PPPOE_SES_HLEN;
++	}
++	l3 = d + p;
++
++	if (et == htons(ETH_P_IP)) {
++		struct iphdr *iph = (struct iphdr *)l3;
++
++		if (iph->version != 4 || iph->ihl != 5 || ip_is_fragment(iph) ||
++		    iph->ttl <= 1)
++			goto pass;
++		l4proto = iph->protocol;
++		tot = ntohs(iph->tot_len);
++		ports = (struct flow_ports *)(iph + 1);
++		tuple.src_v4.s_addr = iph->saddr;
++		tuple.dst_v4.s_addr = iph->daddr;
++		tuple.l3proto = AF_INET;
++		v6 = false;
++		l4min = sizeof(*iph);
++	} else if (et == htons(ETH_P_IPV6)) {
++		struct ipv6hdr *ip6h = (struct ipv6hdr *)l3;
++
++		if (len < p + sizeof(*ip6h) + sizeof(struct udphdr) ||
++		    ip6h->version != 6 || ip6h->hop_limit <= 1)
++			goto pass;
++		l4proto = ip6h->nexthdr;	/* no extension headers */
++		tot = sizeof(*ip6h) + ntohs(ip6h->payload_len);
++		ports = (struct flow_ports *)(ip6h + 1);
++		tuple.src_v6 = ip6h->saddr;
++		tuple.dst_v6 = ip6h->daddr;
++		tuple.l3proto = AF_INET6;
++		v6 = true;
++		l4min = sizeof(*ip6h);
++	} else {
++		goto pass;
++	}
++	if (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP)
++		goto pass;
++	l4min += l4proto == IPPROTO_TCP ? sizeof(struct tcphdr) :
++					  sizeof(struct udphdr);
++	if (tot + p > len || tot < l4min ||
++	    (pppoe_len && tot + 2 > pppoe_len))
+ 		goto pass;
+ 
++	if (!(in->flags & IFF_UP))
++		goto pass;
+ 	if (upper != in && br_vlan_enabled(upper))
+ 		goto pass;
+ 	/* only frames addressed to the router are routed */
+ 	if (!ether_addr_equal(d, upper->dev_addr))
+ 		goto pass;
++	/* ingress shaping (SQM download side) must see the packet */
++	if (fwd_rx_tc(dev) || (in != dev && fwd_rx_tc(in)))
++		goto pass;
+ 
+ 	ft = fwd_flowtable(in);
+ 	if (!ft)
+ 		goto pass;
+ 
+-	ports = (struct flow_ports *)(iph + 1);
+-	tuple.src_v4.s_addr = iph->saddr;
+-	tuple.dst_v4.s_addr = iph->daddr;
+ 	tuple.src_port = ports->source;
+ 	tuple.dst_port = ports->dest;
+-	tuple.l3proto = AF_INET;
+-	tuple.l4proto = iph->protocol;
++	tuple.l4proto = l4proto;
+ 	tuple.iifidx = in->ifindex;
++	/* the flowtable keys encapsulations in wire order (outermost first) */
++	for (i = 0; i < n_enc; i++) {
++		tuple.encap[i].id = wire[i].id;
++		tuple.encap[i].proto = wire[i].proto;
++	}
+ 
+ 	th = flow_offload_lookup(ft, &tuple);
+ 	if (!th) {
+@@ -351,45 +565,82 @@ static int fwd_rx(struct net_device *dev
+ 	flow = container_of(th, struct flow_offload, tuplehash[dir]);
+ 
+ 	/* same conditions as nf_flow_offload_forward(); else let it decide */
+-	if (th->tuple.encap_num || tot > th->tuple.mtu)
++	if (th->tuple.encap_num != n_enc || th->tuple.in_vlan_ingress ||
++	    tot > th->tuple.mtu)
+ 		goto pass;
+-	if (iph->protocol == IPPROTO_TCP) {
+-		struct tcphdr *tcph = (void *)(iph + 1);
++	if (l4proto == IPPROTO_TCP) {
++		struct tcphdr *tcph = (struct tcphdr *)ports;
+ 
+ 		if (tcph->fin || tcph->rst)
+ 			goto pass;	/* normal path tears the flow down */
+ 	}
++	if (v6 && (test_bit(NF_FLOW_SNAT, &flow->flags) ||
++		   test_bit(NF_FLOW_DNAT, &flow->flags)))
++		goto pass;		/* NAT66: rare, left to the flowtable */
++
++	/*
++	 * Encapsulated input: the VLAN/PPP device the packet logically arrives
++	 * on is the reverse direction's output. Its ingress shaping must see the
++	 * packet, and its counters are kept.
++	 */
++	if (n_enc) {
++		const struct flow_offload_tuple *rev = &flow->tuplehash[!dir].tuple;
++		struct net_device *ldev;
++
++		if (rev->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
++			ldev = fwd_dev_by_index(dev_net(in), rev->out.ifidx);
++		else if (rev->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
++			ldev = rev->dst_cache->dev;
++		else
++			goto pass;
++		if (!ldev)
++			goto pass;
++		lie = fwd_out_dev(dev, ldev);
++		if (lie->skb_xmit || lie->n_encap != n_enc)
++			goto pass;
++		for (i = 0; i < n_enc; i++)
++			if (fwd_rx_tc(lie->encap[i].dev))
++				goto pass;
++	}
+ 
+ 	if (th->tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT) {
+-		/* bridge/DSA paths: MACs resolved when the flow was offloaded */
+-		const struct fwd_out_ent *hint =
+-			&fwd_out_cache[(unsigned int)th->tuple.out.ifidx &
+-				       (FWD_OUT_SLOTS - 1)];
+-
+-		out = READ_ONCE(hint->dev);
+-		if (!out || hint->ifindex != th->tuple.out.ifidx)
+-			out = dev_get_by_index_rcu(dev_net(in),
+-						   th->tuple.out.ifidx);
++		/* bridge/DSA/VLAN/PPPoE paths: MACs resolved when the flow was offloaded */
++		out = fwd_dev_by_index(dev_net(in), th->tuple.out.ifidx);
+ 		dmac = th->tuple.out.h_dest;
+ 		smac = th->tuple.out.h_source;
+ 	} else if (th->tuple.xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
+ 		/*
+-		 * Plain ports (eth1, eth2): next hop from the cached route,
+-		 * MAC from the neighbour table. Only confirmed entries are
+-		 * used; anything else takes the normal path, which also
++		 * Routed ports (eth1, eth2, Wi-Fi): next hop from the cached
++		 * route, MAC from the neighbour table. Only confirmed entries
++		 * are used; anything else takes the normal path, which also
+ 		 * keeps the neighbour state machine (probes) running.
+ 		 */
+-		struct rtable *rt = dst_rtable(th->tuple.dst_cache);
+ 		struct neighbour *n;
+-		__be32 nexthop;
+ 
+-		if (!dst_check(&rt->dst, th->tuple.dst_cookie))
++		if (!dst_check(th->tuple.dst_cache, th->tuple.dst_cookie))
+ 			goto pass;
+-		out = rt->dst.dev;
++		out = th->tuple.dst_cache->dev;
+ 		if (!out || dsa_user_dev_check(out))
+ 			goto pass;
+-		nexthop = rt_nexthop(rt, flow->tuplehash[!dir].tuple.src_v4.s_addr);
+-		n = __ipv4_neigh_lookup_noref(out, (__force u32)nexthop);
++		if (!out->header_ops) {
++			/* PPP and other headerless devices: the stack builds it */
++			dmac = smac = NULL;
++			goto resolved;
++		}
++		if (v6) {
++			const struct rt6_info *rt = dst_rt6_info(th->tuple.dst_cache);
++			const struct in6_addr *nh;
++
++			nh = rt6_nexthop((struct rt6_info *)rt,
++					 &flow->tuplehash[!dir].tuple.src_v6);
++			n = __ipv6_neigh_lookup_noref(out, nh);
++		} else {
++			struct rtable *rt = dst_rtable(th->tuple.dst_cache);
++			__be32 nexthop;
++
++			nexthop = rt_nexthop(rt, flow->tuplehash[!dir].tuple.src_v4.s_addr);
++			n = __ipv4_neigh_lookup_noref(out, (__force u32)nexthop);
++		}
+ 		if (!n || !(READ_ONCE(n->nud_state) &
+ 			    (NUD_REACHABLE | NUD_PERMANENT | NUD_NOARP)))
+ 			goto pass;
+@@ -397,30 +648,79 @@ static int fwd_rx(struct net_device *dev
+ 		dmac = nh_mac;
+ 		smac = out->dev_addr;
+ 	} else {
+-		goto pass;
++		goto pass;	/* IPsec (XFRM) and others: the flowtable's job */
+ 	}
++resolved:
+ 	if (!out || !(out->flags & IFF_UP))
+ 		goto pass;
+ 	oe = fwd_out_dev(dev, out);
+-	if (!oe)
+-		goto pass;
+-	txdev = oe->txdev;
++	use_skb = oe->skb_xmit || !dmac || fwd_tx_shaped(out);
++	if (!use_skb) {
++		if (fwd_tx_shaped(oe->txdev) ||
++		    (oe->real != out && fwd_tx_shaped(oe->real)))
++			use_skb = true;
++		for (i = 0; i < oe->n_encap && !use_skb; i++)
++			if (fwd_tx_shaped(oe->encap[i].dev))
++				use_skb = true;
++	}
++	if (use_skb && !out->header_ops && th->tuple.xmit_type ==
++						FLOW_OFFLOAD_XMIT_DIRECT) {
++		/* the flowtable's own transmit handles headerless DIRECT outputs */
++		dmac = smac = NULL;
++	}
++
++	if (use_skb) {
++		/* PKO path not usable: transmit an skb, as the flowtable would */
++		flow_offload_refresh(ft, flow, false);
++		if (v6)
++			((struct ipv6hdr *)l3)->hop_limit--;
++		else {
++			fwd_nat(flow, (struct iphdr *)l3, dir);
++			ip_decrease_ttl((struct iphdr *)l3);
++		}
++		if (ft->flags & NF_FLOWTABLE_COUNTER)
++			nf_ct_acct_update(flow->ct, dir, tot);
++		if (in_tagged)
++			dev_sw_netstats_rx_add(in, len - BRCM_TAG_LEN);
++		for (i = 0; i < n_enc; i++)
++			fwd_upper_stats(lie->encap[i].dev, tot, true);
++
++		__skb_pull(skb, p);
++		__skb_trim(skb, tot);		/* drop Ethernet padding */
++		skb_reset_network_header(skb);
++		skb->protocol = et;
++		skb->dev = out;
++		skb->ip_summed = CHECKSUM_NONE;
++		if (out->header_ops && dmac &&
++		    dev_hard_header(skb, out, ntohs(et), dmac, smac, skb->len) < 0) {
++			kfree_skb(skb);
++			return CVM_OCT_RX_STOLEN;
++		}
++		dev_queue_xmit(skb);
++		skb_hits++;
++		return CVM_OCT_RX_STOLEN;
++	}
+ 	out_tagged = oe->tagged;
+ 
+-	/* new frame start: drop or insert the 4-byte tag in front of the type */
+-	nd = d;
+-	newlen = len;
+-	if (in_tagged && !out_tagged) {
+-		nd = d + BRCM_TAG_LEN;
+-		newlen = len - BRCM_TAG_LEN;
+-	} else if (!in_tagged && out_tagged) {
+-		nd = d - BRCM_TAG_LEN;
+-		newlen = len + BRCM_TAG_LEN;
+-	}
++	/*
++	 * New L2 header in front of the untouched L3 header: MACs, Broadcom
++	 * tag, then per encapsulation (outermost first) VLAN TPID + TCI or
++	 * PPPoE EtherType + header + PPP protocol, then the EtherType unless
++	 * PPP already named the protocol.
++	 */
++	l2out = 2 * ETH_ALEN + (out_tagged ? BRCM_TAG_LEN : 0);
++	for (i = 0; i < oe->n_encap; i++)
++		l2out += oe->encap[i].proto == htons(ETH_P_PPP_SES) ?
++			 2 + PPPOE_SES_HLEN : VLAN_HLEN;
++	if (!oe->n_encap ||
++	    oe->encap[oe->n_encap - 1].proto != htons(ETH_P_PPP_SES))
++		l2out += 2;
++	nd = l3 - l2out;
++	newlen = l2out + (len - p);	/* keeps any Ethernet padding */
+ 	buf = work->packet_ptr;
+ 	base = ((buf.s.addr >> 7) - buf.s.back) << 7;	/* FPA buffer start */
+ 	addr = buf.s.addr + (nd - d);
+-	if (addr < base || newlen < ETH_ZLEN)
++	if (addr < base || newlen > 2 * ETH_DATA_LEN)
+ 		goto pass;
+ 	buf.s.addr = addr;
+ 	buf.s.back = (addr >> 7) - (base >> 7);
+@@ -428,28 +728,66 @@ static int fwd_rx(struct net_device *dev
+ 	/* commit: from here on the packet is forwarded or dropped */
+ 	flow_offload_refresh(ft, flow, false);
+ 
+-	fwd_nat(flow, iph, dir);
+-	ip_decrease_ttl(iph);
++	if (v6) {
++		((struct ipv6hdr *)l3)->hop_limit--;
++	} else {
++		fwd_nat(flow, (struct iphdr *)l3, dir);
++		ip_decrease_ttl((struct iphdr *)l3);
++	}
+ 	if (ft->flags & NF_FLOWTABLE_COUNTER)
+ 		nf_ct_acct_update(flow->ct, dir, tot);
+ 
+-	/* EtherType is already in place for every layout */
+-	memcpy(nd, dmac, ETH_ALEN);
+-	memcpy(nd + ETH_ALEN, smac, ETH_ALEN);
++	w = nd;
++	memcpy(w, dmac, ETH_ALEN);
++	memcpy(w + ETH_ALEN, smac, ETH_ALEN);
++	w += 2 * ETH_ALEN;
+ 	if (out_tagged) {
+ 		/* Broadcom tag, CPU -> switch: forward to exactly this port */
+-		nd[12] = 1 << BRCM_OPCODE_SHIFT;
+-		nd[13] = 0;
+-		nd[14] = 0;
+-		nd[15] = BIT(oe->port) & BRCM_IG_DSTMAP1_MASK;
++		w[0] = 1 << BRCM_OPCODE_SHIFT;
++		w[1] = 0;
++		w[2] = 0;
++		w[3] = BIT(oe->port) & BRCM_IG_DSTMAP1_MASK;
++		w += BRCM_TAG_LEN;
++	}
++	for (i = 0; i < oe->n_encap; i++) {
++		const struct fwd_encap *e = &oe->encap[i];
++
++		put_unaligned(e->proto, (__be16 *)w);
++		if (e->proto == htons(ETH_P_PPP_SES)) {
++			w[2] = 0x11;			/* version 1, type 1 */
++			w[3] = 0;			/* session data */
++			put_unaligned_be16(e->id, w + 4);
++			put_unaligned_be16(tot + 2, w + 6);
++			put_unaligned_be16(v6 ? PPP_IPV6 : PPP_IP, w + 8);
++			w += 2 + PPPOE_SES_HLEN;
++		} else {
++			put_unaligned_be16(e->id, w + 2);
++			w += VLAN_HLEN;
++		}
++	}
++	if (w != l3)
++		put_unaligned(et, (__be16 *)w);
++	/*
++	 * Minimum frame size: 60 bytes, and 64 with a Broadcom tag, because the
++	 * switch checks the length after stripping the tag and drops runts
++	 * (same as tag_brcm's padding). Pad with zeros, never stale data.
++	 */
++	min = out_tagged ? ETH_ZLEN + BRCM_TAG_LEN : ETH_ZLEN;
++	if (newlen < min) {
++		memset(nd + newlen, 0, min - newlen);
++		newlen = min;
+ 	}
+ 
+ 	if (in_tagged)
+ 		dev_sw_netstats_rx_add(in, len - BRCM_TAG_LEN);
++	for (i = 0; i < n_enc; i++)
++		fwd_upper_stats(lie->encap[i].dev, tot, true);
+ 	if (out_tagged)
+-		dev_sw_netstats_tx_add(out, 1, newlen - BRCM_TAG_LEN);
++		dev_sw_netstats_tx_add(oe->real, 1, newlen - BRCM_TAG_LEN);
++	for (i = 0; i < oe->n_encap; i++)
++		fwd_upper_stats(oe->encap[i].dev, tot, false);
+ 
+-	if (unlikely(cvm_oct_xmit_fpa_buffer(txdev, buf, newlen)))
++	if (unlikely(cvm_oct_xmit_fpa_buffer(oe->txdev, buf, newlen)))
+ 		return CVM_OCT_RX_DROP;
+ 	hits++;
+ 	return CVM_OCT_RX_SENT;

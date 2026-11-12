@@ -1,0 +1,72 @@
+From: Lachlan Green <69705346+CL0utM4N@users.noreply.github.com>
+Subject: [PATCH] netfilter: flowtable: keep ingress shaping on VLAN/PPPoE devices
+
+With software flow offloading the flowtable hook sits on the lower device
+(e.g. eth1) and pops VLAN/PPPoE headers itself, so packets never reach the
+VLAN or PPP device. Ingress shaping there (SQM on pppoe-wan or eth1.N,
+tc ingress + ifb) was silently bypassed for offloaded downloads. If that
+device has tc ingress, leave the packet to the normal path.
+
+diff -Nurp a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+--- a/net/netfilter/nf_flow_table_ip.c	2026-11-12 14:47:52.031088596 +1100
++++ b/net/netfilter/nf_flow_table_ip.c	2026-11-12 14:47:52.032900086 +1100
+@@ -302,6 +302,37 @@ static bool nf_flow_skb_encap_protocol(s
+ 	return false;
+ }
+ 
++/*
++ * Ingress shaping (tc ingress, e.g. SQM via ifb) on the VLAN or PPP device a
++ * packet logically arrives on. The flowtable pops the encapsulation on the
++ * lower device, so offloading the packet would bypass that shaper: leave it
++ * to the normal path, which passes through the upper device.
++ */
++static bool nf_flow_encap_shaped(const struct flow_offload *flow,
++				 enum flow_offload_tuple_dir dir,
++				 const struct net_device *in)
++{
++#ifdef CONFIG_NET_XGRESS
++	const struct flow_offload_tuple *rev = &flow->tuplehash[!dir].tuple;
++	const struct net_device *dev;
++
++	switch (rev->xmit_type) {
++	case FLOW_OFFLOAD_XMIT_DIRECT:
++		dev = dev_get_by_index_rcu(dev_net(in), rev->out.ifidx);
++		break;
++	case FLOW_OFFLOAD_XMIT_NEIGH:
++	case FLOW_OFFLOAD_XMIT_XFRM:
++		dev = rev->dst_cache ? rev->dst_cache->dev : NULL;
++		break;
++	default:
++		return false;
++	}
++	return dev && dev != in && rcu_access_pointer(dev->tcx_ingress);
++#else
++	return false;
++#endif
++}
++
+ static void nf_flow_encap_pop(struct sk_buff *skb,
+ 			      struct flow_offload_tuple_rhash *tuplehash)
+ {
+@@ -376,6 +407,10 @@ static int nf_flow_offload_forward(struc
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+ 
++	if (tuplehash->tuple.encap_num &&
++	    nf_flow_encap_shaped(flow, dir, ctx->in))
++		return 0;
++
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+ 		return 0;
+@@ -655,6 +690,10 @@ static int nf_flow_offload_ipv6_forward(
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+ 
++	if (tuplehash->tuple.encap_num &&
++	    nf_flow_encap_shaped(flow, dir, ctx->in))
++		return 0;
++
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+ 		return 0;

@@ -140,3 +140,26 @@ CONFIG_TARGET_ROOTFS_INITRAMFS=y
 # CONFIG_KERNEL_MPTCP_IPV6 is not set
 # CONFIG_KERNEL_CGROUP_BPF is not set
 # CONFIG_KERNEL_SWAP is not set
+CONFIG_PACKAGE_kmod-ipsec=y
+CONFIG_PACKAGE_strongswan=y
+CONFIG_PACKAGE_luci-app-strongswan-swanctl=y
+CONFIG_PACKAGE_strongswan-swanctl=y
+CONFIG_PACKAGE_strongswan-charon=y
+CONFIG_PACKAGE_strongswan-libtls=y
+CONFIG_PACKAGE_strongswan-pki=y
+CONFIG_PACKAGE_strongswan-mod-openssl=y
+CONFIG_PACKAGE_strongswan-mod-kernel-netlink=y
+CONFIG_PACKAGE_strongswan-mod-socket-default=y
+CONFIG_PACKAGE_strongswan-mod-random=y
+CONFIG_PACKAGE_strongswan-mod-pem=y
+CONFIG_PACKAGE_strongswan-mod-pkcs1=y
+CONFIG_PACKAGE_strongswan-mod-x509=y
+CONFIG_PACKAGE_strongswan-mod-pubkey=y
+CONFIG_PACKAGE_strongswan-mod-constraints=y
+CONFIG_PACKAGE_strongswan-mod-attr=y
+CONFIG_PACKAGE_strongswan-mod-resolve=y
+CONFIG_PACKAGE_strongswan-mod-eap-identity=y
+CONFIG_PACKAGE_strongswan-mod-eap-mschapv2=y
+CONFIG_PACKAGE_kmod-ipsec4=y
+CONFIG_PACKAGE_kmod-ipsec6=y
+CONFIG_PACKAGE_kmod-crypto-seqiv=y
