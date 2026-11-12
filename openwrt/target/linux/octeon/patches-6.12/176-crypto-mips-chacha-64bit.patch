@@ -11,11 +11,10 @@ and the jump-table address is formed with PTR_LA. o32 output is unchanged.
 On a 500 MHz CN5010: chacha20 46.7 MB/s vs 33.3 MB/s generic (1420-byte
 blocks), rfc7539esp(chacha20,poly1305) 29.1 vs 23.1 MB/s. WireGuard uses
 it through the ChaCha library interface.
-
 diff -Nurp a/arch/mips/crypto/Kconfig b/arch/mips/crypto/Kconfig
---- a/arch/mips/crypto/Kconfig	2026-11-12 09:53:31.999330508 +1100
-+++ b/arch/mips/crypto/Kconfig	2026-11-12 09:53:32.013911278 +1100
-@@ -100,7 +100,7 @@ config CRYPTO_SHA512_OCTEON
+--- a/arch/mips/crypto/Kconfig	2026-11-12 10:31:06.322688711 +1100
++++ b/arch/mips/crypto/Kconfig	2026-11-12 10:31:06.338194994 +1100
+@@ -114,7 +114,7 @@ config CRYPTO_SHA512_OCTEON
  
  config CRYPTO_CHACHA_MIPS
  	tristate
@@ -24,7 +23,7 @@ diff -Nurp a/arch/mips/crypto/Kconfig b/arch/mips/crypto/Kconfig
  	select CRYPTO_SKCIPHER
  	select CRYPTO_ARCH_HAVE_LIB_CHACHA
  	default CRYPTO_LIB_CHACHA_INTERNAL
-@@ -108,6 +108,6 @@ config CRYPTO_CHACHA_MIPS
+@@ -122,6 +122,6 @@ config CRYPTO_CHACHA_MIPS
  	  Length-preserving ciphers: ChaCha20, XChaCha20, and XChaCha12
  	  stream cipher algorithms
  

@@ -1265,3 +1265,20 @@ define KernelPackage/crypto-des3-octeon/description
 endef
 
 $(eval $(call KernelPackage,crypto-des3-octeon))
+
+
+define KernelPackage/crypto-gcm-octeon
+  TITLE:=AES-GCM (one pass) using the OCTEON crypto unit
+  DEPENDS:=@TARGET_octeon +kmod-crypto-aead +kmod-crypto-gcm +kmod-crypto-manager
+  KCONFIG:=CONFIG_CRYPTO_AES_GCM_OCTEON
+  FILES:=$(LINUX_DIR)/arch/mips/cavium-octeon/crypto/octeon-gcm.ko
+  AUTOLOAD:=$(call AutoLoad,09,octeon-gcm)
+  $(call AddDepends/crypto)
+endef
+
+define KernelPackage/crypto-gcm-octeon/description
+  gcm(aes) and rfc4106(gcm(aes)) (IPsec ESP) computed in one pass on the
+  OCTEON AES unit and Galois-field multiplier.
+endef
+
+$(eval $(call KernelPackage,crypto-gcm-octeon))

@@ -29,7 +29,7 @@ replaces it with a current Linux 6.12 kernel, nftables firewall, WPA3 and LuCI o
 | DS1337 battery-backed clock | ✅ |
 | USB 2.0: storage (ext4, FAT, exFAT, NTFS), printer, phone tethering | ✅ drivers in image |
 | CPU usage on the LuCI overview page | ✅ |
-| Octeon crypto unit (new drivers): AES ECB/CBC/CTR, GHASH (so AES-GCM runs in hardware), optional 3DES; see [Crypto](#crypto) | ✅ tested (kernel self-tests incl. fuzzing, benchmark) |
+| Octeon crypto unit (new drivers): AES ECB/CBC/CTR, GHASH, one-pass AES-GCM (128.8 MB/s, 2.4x), optional 3DES; see [Crypto](#crypto) | ✅ tested (kernel self-tests incl. fuzzing, benchmark) |
 | ChaCha20 assembly on the 64-bit Octeon (used by WireGuard): +40% over generic C | ✅ tested (kernel self-tests incl. fuzzing, benchmark) |
 
 Included packages beyond OpenWrt's defaults: WireGuard, SQM (cake), ksmbd file sharing,
@@ -60,7 +60,7 @@ official servers work.
 | `patches-6.12/162-dts-dlink-dsr-1000n-switch.patch` | BCM53115 (b53, MDIO address 30) with port labels; `wan2` label |
 | `patches-6.12/163-staging-octeon-accept-length-errors.patch` | Don't drop frames for PIP length errors (Broadcom DSA tags trigger them) |
 | `patches-6.12/164-dts-dlink-dsr-1000n-buttons.patch` | Reset and WPS buttons (gpio-keys-polled) |
-| `patches-6.12/165-crypto-octeon-add-aes.patch` | **New drivers** for the Octeon crypto coprocessor (mainline only uses it for MD5/SHA): `octeon-aes` (AES-128/192/256 block cipher, ECB, CBC, CTR), `octeon-ghash` (GCM's GHASH on the Galois-field multiplier, so `gcm(aes)` runs entirely on the crypto unit) and `octeon-des3` (3DES ECB/CBC, not loaded by default). Each checks itself at load (FIPS-197 / SP 800-38A vectors, cross-checks against the generic code with random data and odd splits) and refuses to register on a mismatch. Used automatically by IPsec, SMB3 encryption, dm-crypt |
+| `patches-6.12/165-crypto-octeon-add-aes.patch` | **New drivers** for the Octeon crypto coprocessor (mainline only uses it for MD5/SHA): `octeon-aes` (AES-128/192/256 block cipher, ECB, CBC, CTR), `octeon-ghash` (GCM's GHASH on the Galois-field multiplier), `octeon-gcm` (one-pass AES-GCM: `gcm(aes)` and IPsec's `rfc4106(gcm(aes))`) and `octeon-des3` (3DES ECB/CBC, not loaded by default). Each checks itself at load (FIPS-197 / SP 800-38A vectors, cross-checks against the generic code with random data and odd splits) and refuses to register on a mismatch. Used automatically by IPsec, SMB3 encryption, dm-crypt |
 | `patches-6.12/176-crypto-mips-chacha-64bit.patch` | Linux's MIPS32r2 ChaCha assembly ported to the 64-bit n64 ABI and enabled for Octeon (register names, 5th argument in `a4`, 64-bit saves and pointer arithmetic). WireGuard uses it through the ChaCha library |
 | `patches-6.12/166-staging-octeon-rx-fastpath.patch` | Octeon RX fast path (on by default via `octeon-accel`). Hands established flows straight from the driver's receive loop to the firewall's flowtable (needs software flow offloading on), skipping DSA's GRO pass, a second stack pass and the bridge. `echo 1 > /sys/module/octeon_ethernet/parameters/fastpath`; counters `fastpath_hits/misses/seen`. RAM-boot test: all transfers checksum-correct, ~+10% download / ~+40% upload through a test server on the router itself |
 | `patches-6.12/167-staging-octeon-skb-reuse-switch.patch` | **Buffer reuse:** the PKO frees a transmitted buffer straight back into the hardware RX pool instead of an skb free + reallocation per packet. The driver's old code for this was compiled out with netfilter and its size check no longer matched current kernels; fixed, and the skb is reset to a freshly allocated state before reuse. Runtime switch `skb_reuse`, counter `skb_reused` |
@@ -76,9 +76,10 @@ official servers work.
 | `files/etc/init.d/octeon-accel`, `files/etc/config/octeon_accel` | Applies `fastpath`, `skb_reuse`, `conduit_noqueue` (no qdisc on the Octeon ports) and `wqe_fwd` (octeon-fwd) at boot, all on; set an option to `0` and `/etc/init.d/octeon-accel reload` to turn it off. `des3` (hardware 3DES) is off; set it to `1` only for old VPN peers that need 3DES |
 | `files/etc/uci-defaults/92-dsr1000n-octeon-accel` | Enables the above and software flow offloading on first boot |
 | `files/etc/uci-defaults/91-dsr1000n-wifi-name` | The stock AR9160 card reports Atheros' reference ID 168c:2082, which OpenWrt's tables call "Ubiquiti SR71A" with a +7 dB TX power offset; corrects that entry to "Atheros AR9160", 0 dB, on this board |
-| `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon`, `kmod-crypto-ghash-octeon`, `kmod-crypto-des3-octeon` packages; `kmod-crypto-lib-chacha20` uses the ported ChaCha on Octeon |
+| `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon`, `kmod-crypto-ghash-octeon`, `kmod-crypto-gcm-octeon`, `kmod-crypto-des3-octeon` packages; `kmod-crypto-lib-chacha20` uses the ported ChaCha on Octeon |
 | `image/Makefile` | `Device/dlink_dsr-1000n`: ELF kernel with appended DTB + squashfs, `sysupgrade.bin` |
-| `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core); `CVMSEG_SIZE=2`, no `LOCK_L2` (see Performance) |
+| `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core); `CVMSEG_SIZE=2`, no `LOCK_L2` (see Performance); size trims (see [Flash usage](#flash-usage)) |
+| `include/kernel-defaults.mk` | Stops forcing `KALLSYMS_UNCOMPRESSED`: it helps kernels stored compressed, but this kernel is stored as a plain ELF |
 | `base-files/lib/preinit/01_sysinfo` | Board detection from the DT model (U-Boot reports board type 20006, which OpenWrt calls ITUS_SHIELD) |
 | `base-files/etc/board.d/01_network` | lan1-4 / wan, real MACs from product data |
 | `base-files/lib/upgrade/platform.sh` | sysupgrade writes the `firmware` MTD partition |
@@ -167,17 +168,41 @@ multiplier (GHASH). Mainline only used it for the hashes; patch 165 adds the res
 |---|---|---|---|
 | AES-128 ECB | 16.0 MB/s | **131.7 MB/s** | `ecb-aes-octeon` |
 | AES-128 CBC | — | **138.0 MB/s** | `cbc-aes-octeon` |
-| AES-GCM (IPsec `rfc4106`, AES-128) | — | **53.5 MB/s** | `gcm_base(ctr-aes-octeon,ghash-octeon)` |
+| AES-GCM (IPsec `rfc4106`, AES-128) | 53.5 MB/s (`gcm` template on the AES + GHASH drivers) | **128.8 MB/s** | `rfc4106-gcm-aes-octeon` (one pass) |
 | GHASH | 32.1 MB/s | **161.7 MB/s** | `ghash-octeon` |
 | SHA-1 | 18.1 MB/s | **168.5 MB/s** | `octeon-sha1` (mainline driver, now packaged) |
 | 3DES ECB/CBC | 2.9 MB/s | **93.6 MB/s** | `octeon-des3`, only with `option des3 '1'` |
 | ChaCha20 | 33.3 MB/s | **46.7 MB/s** | `chacha20-mips` (patch 176) |
 | ChaCha20-Poly1305 (IPsec `rfc7539esp`) | 23.1 MB/s | **29.1 MB/s** | `chacha20-mips` + `poly1305-mips` |
 
+`octeon-gcm` does AES-GCM in one pass: each 16-byte block is encrypted by the AES unit and
+hashed by the multiplier in the same crypto-unit session, with the next block's AES started
+before the current block is hashed, so both units work at once (with 4096-byte blocks: 182 MB/s).
+The kernel's `gcm` template instead runs CTR and GHASH as two passes over the data.
+
 ChaCha20 and Poly1305 have no hardware unit, and they cannot be translated onto the AES or
 GHASH units (different operations), so they stay on the CPU; patch 176 makes them use the
-existing MIPS assembly instead of C. For a VPN on this router, AES-GCM is the faster choice:
+existing MIPS assembly instead of C. For a VPN on this router, AES-GCM is over 4x faster:
 IPsec/IKEv2 with `aes128gcm16` or `aes256gcm16`. WireGuard always uses ChaCha20-Poly1305.
+
+### Flash usage
+
+U-Boot boots the kernel as a plain ELF (no compressed-kernel support for Octeon), so every
+kilobyte built into the kernel costs a kilobyte of flash, while modules sit compressed in
+squashfs. Of the 29 MB firmware partition the image uses **17.0 MB** (kernel 8.0 MB, rootfs
+8.2 MB), leaving **~12.7 MB** for settings and extra packages. Trims that took 2.2 MB off
+with no change in forwarding, TCP or crypto speed (A/B measured):
+
+| Trim | Kernel saving |
+|---|---|
+| ext4, FAT/VFAT, NLS, SCSI disk and USB storage as modules instead of built in (loaded at boot as before) | ~0.9 MB |
+| No eBPF syscall (`BPF_SYSCALL`, `KERNEL_CGROUP_BPF`; the classic-BPF JIT for packet sockets stays) | ~0.5 MB |
+| 32 KB kernel log buffer instead of 128 KB (the boot log is ~18 KB; `logread` is separate) | ~0.35 MB, plus 96 KB RAM |
+| Compressed kallsyms | ~0.3 MB |
+| No MPTCP, no swap | ~0.15 MB |
+
+Most of the rootfs is features: OpenSSL + libxml2 come with iPhone tethering
+(`usbmuxd`), iptables-nft with SQM, e2fsprogs with USB storage.
 
 ## Build
 
