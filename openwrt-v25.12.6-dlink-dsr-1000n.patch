@@ -249,6 +249,29 @@ index 0000000..2dc3f3a
 +
 +uci commit network
 +exit 0
+diff --git a/files/etc/uci-defaults/94-dsr1000n-fstab b/files/etc/uci-defaults/94-dsr1000n-fstab
+new file mode 100755
+index 0000000..e6fea28
+--- /dev/null
++++ b/files/etc/uci-defaults/94-dsr1000n-fstab
+@@ -0,0 +1,17 @@
++#!/bin/sh
++# USB storage: mount any USB drive automatically under /mnt/<device> (e.g. for
++# ksmbd file sharing). Without /etc/config/fstab block-mount mounts nothing, and
++# the stock default (block detect) leaves unknown drives unmounted. Creates the
++# config if missing and enables auto-mount, unless mounts are already set up.
++
++command -v block >/dev/null || exit 0
++[ -f /etc/config/fstab ] || block detect > /etc/config/fstab 2>/dev/null
++uci -q get fstab.@global[0] >/dev/null || uci -q add fstab global >/dev/null
++
++# leave a hand-made configuration alone
++uci -q show fstab | grep -q "=mount$" && exit 0
++
++uci set fstab.@global[0].anon_mount='1'
++uci set fstab.@global[0].auto_mount='1'
++uci commit fstab
++exit 0
 diff --git a/files/usr/share/rpcd/acl.d/luci-mod-status-index-cpu.json b/files/usr/share/rpcd/acl.d/luci-mod-status-index-cpu.json
 new file mode 100755
 index 0000000..e392cff
@@ -648,7 +671,7 @@ index 62f97e8..1a48d1a 100755
 diff --git a/target/linux/octeon/config-6.12 b/target/linux/octeon/config-6.12
 old mode 100644
 new mode 100755
-index 563388d..4010b2d
+index 563388d..f078476
 --- a/target/linux/octeon/config-6.12
 +++ b/target/linux/octeon/config-6.12
 @@ -1,3 +1,65 @@
@@ -790,11 +813,12 @@ index 563388d..4010b2d
  CONFIG_FUNCTION_ALIGNMENT=0
  CONFIG_FWNODE_MDIO=y
  CONFIG_FW_LOADER_PAGED_BUF=y
-@@ -129,10 +169,10 @@ CONFIG_IRQCHIP=y
+@@ -129,10 +169,11 @@ CONFIG_IRQCHIP=y
  CONFIG_IRQ_DOMAIN=y
  CONFIG_IRQ_FORCED_THREADING=y
  CONFIG_IRQ_WORK=y
 -CONFIG_JBD2=y
++CONFIG_JUMP_LABEL=y
  CONFIG_LEGACY_DIRECT_IO=y
  CONFIG_LIBFDT=y
  CONFIG_LOCK_DEBUGGING_SUPPORT=y
@@ -802,7 +826,7 @@ index 563388d..4010b2d
  CONFIG_MDIO_BUS=y
  CONFIG_MDIO_CAVIUM=y
  CONFIG_MDIO_DEVICE=y
-@@ -147,44 +187,34 @@ CONFIG_MIPS_ELF_APPENDED_DTB=y
+@@ -147,44 +188,34 @@ CONFIG_MIPS_ELF_APPENDED_DTB=y
  CONFIG_MIPS_FP_SUPPORT=y
  CONFIG_MIPS_L1_CACHE_SHIFT=7
  CONFIG_MIPS_L1_CACHE_SHIFT_7=y
@@ -850,7 +874,7 @@ index 563388d..4010b2d
  CONFIG_OCTEON_WDT=y
  CONFIG_OF=y
  CONFIG_OF_ADDRESS=y
-@@ -198,12 +228,7 @@ CONFIG_PADATA=y
+@@ -198,12 +229,7 @@ CONFIG_PADATA=y
  CONFIG_PAGE_POOL=y
  CONFIG_PAGE_SIZE_LESS_THAN_256KB=y
  CONFIG_PAGE_SIZE_LESS_THAN_64KB=y
@@ -863,7 +887,7 @@ index 563388d..4010b2d
  CONFIG_PCI_DOMAINS=y
  CONFIG_PCI_DRIVERS_LEGACY=y
  CONFIG_PERF_USE_VMALLOC=y
-@@ -213,33 +238,22 @@ CONFIG_PHYLIB_LEDS=y
+@@ -213,33 +239,22 @@ CONFIG_PHYLIB_LEDS=y
  CONFIG_PHYLINK=y
  CONFIG_PHYS_ADDR_T_64BIT=y
  CONFIG_PTP_1588_CLOCK_OPTIONAL=y
@@ -897,7 +921,7 @@ index 563388d..4010b2d
  CONFIG_SPLIT_PTE_PTLOCKS=y
  CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU=y
  CONFIG_SWIOTLB=y
-@@ -261,21 +275,13 @@ CONFIG_TREE_SRCU=y
+@@ -261,21 +276,13 @@ CONFIG_TREE_SRCU=y
  CONFIG_USB=y
  CONFIG_USB_COMMON=y
  CONFIG_USB_EHCI_BIG_ENDIAN_MMIO=y

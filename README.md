@@ -70,6 +70,7 @@ official servers work.
 | `patches-6.12/172-netfilter-flowtable-export-inet-hook.patch` | Exports `nf_flow_offload_inet_hook` so octeon-fwd can find a port's flowtable |
 | `patches-6.12/177-staging-octeon-fwd-ipv6-encap-sqm-wifi.patch` | octeon-fwd: IPv6, VLAN/PPPoE (also PPPoE over VLAN), skb transmit for Wi-Fi/other outputs and shaped ports, never bypassing SQM; driver fast path leaves ports with tc ingress to the normal path |
 | `patches-6.12/178-netfilter-flowtable-keep-ingress-shaping-on-encap.patch` | Kernel flowtable: packets for a VLAN/PPPoE device with tc ingress (SQM download) take the normal path instead of bypassing the shaper |
+| `files/etc/uci-defaults/94-dsr1000n-fstab` | Auto-mounts USB drives under `/mnt/` (creates `/etc/config/fstab` if missing and turns on mounting of unknown drives, unless mounts are already configured) |
 | `files/etc/hotplug.d/net/30-flowtable-wifi` | Adds Wi-Fi interfaces created after the firewall started to the running flowtable |
 | `patches-6.12/173-dts-dlink-dsr-1000n-wanlink.patch` | Switch port 5 (wired to `eth1`) as user port `wanlink`, fixed 1 Gb/s RGMII |
 | `patches-6.12/174-net-dsa-b53-rgmii-on-531x5-port5.patch` | b53: BCM53115 port 5 in `enabled_ports` (it was left out, so the switch dropped frames to it) and RGMII advertised for it |
@@ -81,7 +82,7 @@ official servers work.
 | `files/etc/uci-defaults/91-dsr1000n-wifi-name` | The stock AR9160 card reports Atheros' reference ID 168c:2082, which OpenWrt's tables call "Ubiquiti SR71A" with a +7 dB TX power offset; corrects that entry to "Atheros AR9160", 0 dB, on this board |
 | `package/kernel/linux/modules/crypto.mk` | `kmod-crypto-aes-octeon`, `kmod-crypto-ghash-octeon`, `kmod-crypto-gcm-octeon`, `kmod-crypto-des3-octeon` packages; `kmod-crypto-lib-chacha20` uses the ported ChaCha on Octeon |
 | `image/Makefile` | `Device/dlink_dsr-1000n`: ELF kernel with appended DTB + squashfs, `sysupgrade.bin` |
-| `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core); `CVMSEG_SIZE=2`, no `LOCK_L2` (see Performance); size trims (see [Flash usage](#flash-usage)) |
+| `config-6.12` | Kernel config, adds `MTD_SPLIT_ELF_FW` + firmware splitting, Broadcom PHY; removes drivers this board has no hardware for, and SMP (single core); `CVMSEG_SIZE=2`, no `LOCK_L2` (see Performance); size trims (see [Flash usage](#flash-usage)); `JUMP_LABEL` (static-branch patching: hook checks on the packet path become patched jumps, ~+2% small-packet forwarding, A/B measured) |
 | `include/kernel-defaults.mk` | Stops forcing `KALLSYMS_UNCOMPRESSED`: it helps kernels stored compressed, but this kernel is stored as a plain ELF |
 | `base-files/lib/preinit/01_sysinfo` | Board detection from the DT model (U-Boot reports board type 20006, which OpenWrt calls ITUS_SHIELD) |
 | `base-files/etc/board.d/01_network` | lan1-4 / wan, real MACs from product data |
@@ -240,8 +241,8 @@ IPsec/IKEv2 with `aes128gcm16` or `aes256gcm16`. WireGuard always uses ChaCha20-
 
 U-Boot boots the kernel as a plain ELF (no compressed-kernel support for Octeon), so every
 kilobyte built into the kernel costs a kilobyte of flash, while modules sit compressed in
-squashfs. Of the 29 MB firmware partition the image uses **18.7 MB** (kernel 8.0 MB, rootfs
-with strongSwan 9.9 MB), leaving **~11 MB** for settings and extra packages. Trims that took
+squashfs. Of the 29 MB firmware partition the image uses **18.6 MB** (kernel 8.0 MB, rootfs
+with strongSwan 9.8 MB), leaving **~11 MB** for settings and extra packages. Trims that took
 2.2 MB off with no change in forwarding, TCP or crypto speed (A/B measured):
 
 | Trim | Kernel saving |
@@ -251,6 +252,7 @@ with strongSwan 9.9 MB), leaving **~11 MB** for settings and extra packages. Tri
 | 32 KB kernel log buffer instead of 128 KB (the boot log is ~18 KB; `logread` is separate) | ~0.35 MB, plus 96 KB RAM |
 | Compressed kallsyms | ~0.3 MB |
 | No MPTCP, no swap | ~0.15 MB |
+| No debugfs, no Wi-Fi mesh or mac80211 debugfs code (image, mostly modules) | ~0.13 MB |
 
 Most of the rootfs is features: OpenSSL + libxml2 come with iPhone tethering
 (`usbmuxd`), iptables-nft with SQM, e2fsprogs with USB storage.

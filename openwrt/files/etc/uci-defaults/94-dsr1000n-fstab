@@ -1,0 +1,17 @@
+#!/bin/sh
+# USB storage: mount any USB drive automatically under /mnt/<device> (e.g. for
+# ksmbd file sharing). Without /etc/config/fstab block-mount mounts nothing, and
+# the stock default (block detect) leaves unknown drives unmounted. Creates the
+# config if missing and enables auto-mount, unless mounts are already set up.
+
+command -v block >/dev/null || exit 0
+[ -f /etc/config/fstab ] || block detect > /etc/config/fstab 2>/dev/null
+uci -q get fstab.@global[0] >/dev/null || uci -q add fstab global >/dev/null
+
+# leave a hand-made configuration alone
+uci -q show fstab | grep -q "=mount$" && exit 0
+
+uci set fstab.@global[0].anon_mount='1'
+uci set fstab.@global[0].auto_mount='1'
+uci commit fstab
+exit 0
